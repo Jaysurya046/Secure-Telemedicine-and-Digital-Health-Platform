@@ -1,0 +1,53 @@
+Django>=5.0,<5.1
+djangorestframework>=3.14.0
+djangorestframework-simplejwt>=5.3.0
+django-cors-headers>=4.3.0
+django-filter>=23.5
+drf-spectacular>=0.27.0
+
+# Database
+psycopg2-binary>=2.9.9
+dj-database-url>=2.1.0
+
+# Redis & Caching
+redis>=5.0.1
+django-redis>=5.4.0
+hiredis>=2.3.2
+
+# Celery
+celery>=5.3.4
+django-celery-beat>=2.5.0
+django-celery-results>=2.5.1
+
+# Security
+argon2-cffi>=23.1.0
+cryptography>=41.0.7
+python-decouple>=3.8
+
+# File handling
+Pillow>=10.1.0
+python-magic>=0.4.27
+
+# Utilities
+python-dateutil>=2.8.2
+pytz>=2023.3
+shortuuid>=1.0.11
+
+# Production server
+gunicorn>=21.2.0
+whitenoise>=6.6.0
+
+# Monitoring
+sentry-sdk>=1.39.1
+
+# Development
+django-debug-toolbar>=4.2.0
+django-extensions>=3.2.3
+ipython>=8.18.1
+
+# Testing
+pytest>=7.4.3
+pytest-django>=4.7.0
+pytest-cov>=4.1.0
+factory-boy>=3.3.0
+faker>=21.0.0
