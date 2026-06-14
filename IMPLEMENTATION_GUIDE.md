@@ -1,522 +1,213 @@
 # Secure Telemedicine Platform - Implementation Guide
 
-## 🎉 What Has Been Built
+Last updated: 2026-06-14
 
-### ✅ Complete Documentation Suite
+## What Is Built
 
-1. **README.md** - Comprehensive project overview with:
-   - Architecture diagram
-   - Technology stack
-   - Core features
-   - Quick start guide
-   - Security features
+The platform currently includes the core service skeletons and main domain workflows across backend, realtime, and frontend layers.
 
-2. **docs/ARCHITECTURE.md** - Detailed system design:
-   - Microservices architecture
-   - Database schema (normalized design)
-   - Data flow diagrams
-   - Scalability considerations
-   - Monitoring and observability
+### Infrastructure
 
-3. **docs/SECURITY.md** - Security implementation:
-   - JWT authentication flow
-   - Role-based access control (RBAC)
-   - Data encryption (in transit and at rest)
-   - Input validation and sanitization
-   - Audit logging
-   - HIPAA and GDPR compliance guidelines
+- `docker-compose.yml` starts PostgreSQL, Redis, Django backend, Celery worker, Celery beat, realtime service, patient portal, and doctor dashboard.
+- Backend, realtime service, patient portal, and doctor dashboard each have Dockerfiles.
+- `.env.example` provides the shared local configuration template.
 
-4. **docs/SETUP.md** - Complete setup instructions:
-   - Docker setup (recommended)
-   - Manual installation steps
-   - Development workflow
-   - Testing procedures
-   - Production deployment guide
-   - Nginx configuration
+### Django Backend
 
-### ✅ Infrastructure Configuration
+The backend is under `backend/` and includes:
 
-1. **docker-compose.yml** - Full container orchestration:
-   - PostgreSQL database
-   - Redis cache
-   - Django backend
-   - Celery worker and beat
-   - Node.js real-time service
-   - Next.js patient portal
-   - React doctor dashboard
+- Django 5 and Django REST Framework.
+- JWT authentication through `djangorestframework-simplejwt`.
+- API docs through `drf-spectacular`.
+- Redis cache/session configuration.
+- Celery configuration.
+- PostgreSQL through `dj-database-url`.
+- Custom exception handling.
+- Audit middleware.
 
-2. **.env.example** - Environment variables template with all required configuration
+Implemented apps:
 
-### ✅ Django Backend - Core Configuration
+- `apps.users`: custom user model, profiles, doctor profile, patient medical info, 2FA model, auth/profile/directory endpoints, custom permissions, health URLs, and user email tasks.
+- `apps.appointments`: appointment and availability models, serializers, viewsets, filters, confirm/cancel/complete actions, and reminder task module.
+- `apps.consultations`: consultation and message models, serializers, viewset, start/end actions, message creation action, and stale-consultation cleanup task module.
+- `apps.medical_records`: records, prescriptions, prescription items, documents, encryption/hash helpers, serializers, viewsets, prescription cancellation, and expiry task module.
+- `apps.audit`: audit log model, middleware, serializer, read-only admin viewset, admin registration, and summary task module.
 
-1. **requirements.txt** - All Python dependencies including:
-   - Django 5.0
-   - Django REST Framework
-   - JWT authentication
-   - Celery for async tasks
-   - PostgreSQL driver
-   - Redis client
-   - Security libraries (Argon2, cryptography)
+### Realtime Service
 
-2. **Dockerfile** - Production-ready container configuration
+The realtime service is under `realtime-service/` and includes:
 
-3. **config/settings.py** - Comprehensive Django settings:
-   - Security configurations (HTTPS, HSTS, CSRF, XSS protection)
-   - JWT authentication setup
-   - CORS configuration
-   - Redis caching
-   - Celery configuration
-   - Email settings
-   - Logging configuration
-   - API documentation (drf-spectacular)
+- Express HTTP server.
+- `/health` and `/ready` endpoints.
+- Socket.io server on `/socket.io`.
+- JWT socket authentication middleware.
+- Redis publisher/subscriber client setup.
+- Consultation room join/leave events.
+- Presence update events.
+- WebRTC offer, answer, and ICE candidate signaling.
+- Chat message events and recent history.
 
-4. **config/urls.py** - Main URL routing with API documentation
+### Patient Portal
 
-5. **config/wsgi.py** - WSGI configuration for deployment
+The patient portal is under `patient-portal/` and includes:
 
-6. **config/celery.py** - Celery task queue with scheduled tasks
+- Next.js 14 app router.
+- TypeScript and TailwindCSS.
+- Landing workspace.
+- Login and registration pages.
+- Dashboard page.
+- Appointment booking/listing page.
+- Consultation room page.
+- `AppNav`, `VideoCall`, and `Chat` components.
+- API and websocket helpers.
 
-7. **manage.py** - Django management script
+### Doctor Dashboard
 
-### ✅ Django Backend - Users App (COMPLETE)
+The doctor dashboard is under `doctor-dashboard/` and includes:
 
-The Users app is **100% complete** and production-ready:
+- Vite React TypeScript app.
+- Operational dashboard layout.
+- Login strip.
+- Dashboard, patients, and consultation views.
+- Patient history and prescription form components.
+- Video call component.
+- API and websocket service modules.
 
-#### Models (apps/users/models.py)
-- **User** - Custom user model with email authentication
-  - UUID primary key
-  - Role-based (patient/doctor/admin)
-  - Email verification
-  - Timestamps
+## Backend API Map
 
-- **UserProfile** - Extended user information
-  - Personal details (name, phone, DOB, gender)
-  - Address information
-  - Avatar upload
+Base URL: `http://localhost:8000/api/`
 
-- **DoctorProfile** - Doctor-specific data
-  - Specialization and license
-  - Experience and fees
-  - Bio and education
-  - Availability and ratings
+Authentication and users:
 
-- **PatientMedicalInfo** - Patient medical data
-  - Blood group, height, weight
-  - Allergies and chronic conditions
-  - Current medications
-  - Emergency contact
+- `POST /auth/register/`
+- `POST /auth/login/`
+- `POST /auth/logout/`
+- `POST /auth/token/refresh/`
+- `GET/PATCH /auth/profile/`
+- `POST /auth/change-password/`
+- `GET /auth/doctors/`
+- `GET /auth/doctors/{id}/`
+- `GET /auth/doctors/{id}/availability/`
+- `GET /auth/patients/`
+- `GET /auth/patients/{id}/`
+- `GET /auth/statistics/`
 
-- **TwoFactorAuth** - 2FA settings
-  - TOTP support
-  - Backup codes
+Appointments:
 
-#### Serializers (apps/users/serializers.py)
-- RegisterSerializer - User registration with validation
-- LoginSerializer - Login credentials
-- UserSerializer - Complete user data
-- DoctorListSerializer & DoctorDetailSerializer
-- PatientListSerializer & PatientDetailSerializer
-- UpdateProfileSerializer - Profile updates
-- ChangePasswordSerializer - Password change
+- `GET/POST /appointments/`
+- `GET/PATCH/PUT/DELETE /appointments/{id}/`
+- `POST /appointments/{id}/confirm/`
+- `POST /appointments/{id}/cancel/`
+- `POST /appointments/{id}/complete/`
+- `GET/POST /appointments/availability/`
+- `GET/PATCH/PUT/DELETE /appointments/availability/{id}/`
 
-#### Views (apps/users/views.py)
-- **RegisterView** - User registration endpoint
-- **LoginView** - JWT authentication
-- **LogoutView** - Token blacklisting
-- **ChangePasswordView** - Password management
-- **UserProfileView** - Get/update profile
-- **DoctorViewSet** - List/retrieve doctors with filtering
-- **PatientViewSet** - List/retrieve patients (doctor/admin only)
-- **statistics_view** - Public statistics
+Consultations:
 
-#### Permissions (apps/users/permissions.py)
-- IsOwnerOrAdmin
-- IsDoctorOrAdmin
-- IsPatientOrAdmin
-- IsDoctor, IsPatient, IsAdmin
-- ReadOnly
+- `GET/POST /consultations/`
+- `GET/PATCH/PUT/DELETE /consultations/{id}/`
+- `POST /consultations/{id}/start/`
+- `POST /consultations/{id}/end/`
+- `POST /consultations/{id}/messages/`
 
-#### URLs (apps/users/urls.py)
-- `/api/auth/register/` - Registration
-- `/api/auth/login/` - Login
-- `/api/auth/logout/` - Logout
-- `/api/auth/token/refresh/` - Token refresh
-- `/api/auth/profile/` - User profile
-- `/api/auth/change-password/` - Password change
-- `/api/auth/doctors/` - Doctor listing
-- `/api/auth/patients/` - Patient listing
-- `/api/auth/statistics/` - Statistics
+Medical records:
 
-#### Health Checks (apps/users/health_urls.py)
-- `/health/` - Basic health check
-- `/health/db/` - Database connectivity
-- `/health/redis/` - Redis connectivity
+- `GET/POST /medical-records/`
+- `GET/PATCH/PUT/DELETE /medical-records/{id}/`
+- `GET/POST /medical-records/prescriptions/`
+- `GET/PATCH/PUT/DELETE /medical-records/prescriptions/{id}/`
+- `POST /medical-records/prescriptions/{id}/cancel/`
+- `GET/POST /medical-records/documents/`
+- `GET/PATCH/PUT/DELETE /medical-records/documents/{id}/`
 
-#### Admin (apps/users/admin.py)
-- Custom admin interface for all models
-- Inline editing for profiles
-- Search and filtering
+Audit:
 
-#### Tasks (apps/users/tasks.py)
-- send_welcome_email
-- send_verification_email
-- send_password_reset_email
-- cleanup_expired_tokens
-- send_bulk_notification
+- `GET /audit/logs/`
+- `GET /audit/logs/{id}/`
 
-#### Other Files
-- apps.py - App configuration
-- exceptions.py - Custom exception handler
-- __init__.py - Package initialization
+Health and docs:
 
-## 🚧 What Needs to Be Built
+- `GET /health/`
+- `GET /health/db/`
+- `GET /health/redis/`
+- `GET /api/docs/`
+- `GET /api/redoc/`
 
-### 1. Appointments App (Priority: HIGH)
+## Recommended Local Validation
 
-**Models needed:**
-```python
-class Appointment:
-    - id (UUID)
-    - patient (FK to User)
-    - doctor (FK to User)
-    - scheduled_at (DateTime)
-    - duration_minutes (Integer)
-    - status (pending/confirmed/completed/cancelled)
-    - reason (Text)
-    - notes (Text)
-    - created_at, updated_at
+Use this sequence when dependencies and Docker are available:
 
-class DoctorAvailability:
-    - doctor (FK to User)
-    - day_of_week (Integer)
-    - start_time (Time)
-    - end_time (Time)
-    - is_available (Boolean)
+```bash
+cp .env.example .env
+docker-compose up -d --build
+docker-compose exec backend python manage.py check
+docker-compose exec backend python manage.py migrate
+docker-compose exec backend python manage.py createsuperuser
 ```
 
-**Endpoints needed:**
-- POST /api/appointments/ - Book appointment
-- GET /api/appointments/ - List appointments
-- GET /api/appointments/{id}/ - Get appointment details
-- PATCH /api/appointments/{id}/ - Update appointment
-- DELETE /api/appointments/{id}/ - Cancel appointment
-- GET /api/appointments/availability/ - Check doctor availability
+Then visit:
 
-**Tasks needed:**
-- send_appointment_reminders - Celery task for reminders
+- Backend docs: http://localhost:8000/api/docs/
+- Patient portal: http://localhost:3000
+- Doctor dashboard: http://localhost:3001
+- Realtime health: http://localhost:3002/health
 
-### 2. Consultations App (Priority: HIGH)
+## Implementation Priorities
 
-**Models needed:**
-```python
-class Consultation:
-    - id (UUID)
-    - appointment (FK to Appointment)
-    - session_id (String)
-    - started_at (DateTime)
-    - ended_at (DateTime)
-    - status (scheduled/active/completed/cancelled)
-    - notes (Text)
-    - recording_url (String, optional)
+### Priority 1: Runtime Verification
 
-class ConsultationMessage:
-    - consultation (FK to Consultation)
-    - sender (FK to User)
-    - message (Text)
-    - timestamp (DateTime)
-```
+- Install Python and Node dependencies in a clean environment.
+- Run migrations against PostgreSQL.
+- Validate all service containers start and stay healthy.
+- Exercise the login, booking, consultation, prescription, and audit flows manually.
 
-**Endpoints needed:**
-- POST /api/consultations/ - Start consultation
-- GET /api/consultations/{id}/ - Get consultation details
-- POST /api/consultations/{id}/end/ - End consultation
-- GET /api/consultations/{id}/token/ - Get WebRTC token
-- GET /api/consultations/{id}/messages/ - Get chat history
+### Priority 2: Backend Tests
 
-### 3. Medical Records App (Priority: HIGH)
+Add tests for:
 
-**Models needed:**
-```python
-class MedicalRecord:
-    - id (UUID)
-    - patient (FK to User)
-    - doctor (FK to User)
-    - consultation (FK to Consultation, optional)
-    - diagnosis (Text)
-    - symptoms (Text)
-    - notes (Text)
-    - created_at, updated_at
+- User registration/login/profile updates.
+- Patient, doctor, and admin authorization boundaries.
+- Appointment creation, filtering, cancellation, confirmation, and completion.
+- Availability validation and appointment conflict handling.
+- Consultation start/end and message creation.
+- Medical record, prescription, and document access control.
+- Audit middleware behavior.
 
-class Prescription:
-    - id (UUID)
-    - medical_record (FK to MedicalRecord)
-    - medication_name (String)
-    - dosage (String)
-    - frequency (String)
-    - duration (String)
-    - instructions (Text)
-    - created_at
+### Priority 3: Frontend and Realtime Tests
 
-class MedicalDocument:
-    - id (UUID)
-    - patient (FK to User)
-    - uploaded_by (FK to User)
-    - document_type (String)
-    - file_path (String, encrypted)
-    - file_hash (String)
-    - uploaded_at
-```
+Add tests for:
 
-**Endpoints needed:**
-- GET /api/medical-records/ - List medical records
-- POST /api/medical-records/ - Create record
-- GET /api/medical-records/{id}/ - Get record details
-- POST /api/prescriptions/ - Create prescription
-- GET /api/prescriptions/ - List prescriptions
-- POST /api/medical-documents/ - Upload document
-- GET /api/medical-documents/{id}/download/ - Download document
+- Patient auth and booking flows.
+- Doctor login, patient selection, prescription submission, and consultation navigation.
+- Socket authentication failures.
+- Consultation room join/leave behavior.
+- WebRTC signaling event forwarding.
+- Chat send/receive behavior.
 
-**Utilities needed:**
-- File encryption/decryption functions
-- Document validation
+### Priority 4: Production Hardening
 
-### 4. Audit App (Priority: MEDIUM)
+- Replace development secrets.
+- Configure HTTPS/WSS.
+- Lock down CORS and CSRF origins.
+- Configure production object storage and medical document encryption/key management.
+- Add backups, monitoring, alerting, log retention, and incident response.
+- Run dependency audits and security tests.
+- Complete healthcare compliance review.
 
-**Models needed:**
-```python
-class AuditLog:
-    - id (UUID)
-    - user (FK to User)
-    - action (String)
-    - resource_type (String)
-    - resource_id (String)
-    - ip_address (IP)
-    - user_agent (String)
-    - timestamp (DateTime)
-    - metadata (JSON)
-```
+## Definition of Done for Production
 
-**Middleware needed:**
-- AuditMiddleware - Log all sensitive operations
+- [ ] Full stack starts cleanly from documented setup steps.
+- [ ] All migrations apply from an empty database.
+- [ ] Meaningful backend, frontend, and realtime tests pass.
+- [ ] API permissions are covered by automated tests.
+- [ ] Medical document storage is encrypted and recoverable with managed keys.
+- [ ] Production secrets and environment variables are configured outside source control.
+- [ ] HTTPS/WSS, CORS, CSRF, HSTS, logging, monitoring, and backups are configured.
+- [ ] Compliance and legal requirements are reviewed for the target region.
 
-**Endpoints needed:**
-- GET /api/audit/ - List audit logs (admin only)
-- GET /api/audit/export/ - Export audit logs
+## Notes for Future Development
 
-**Tasks needed:**
-- generate_daily_reports - Generate audit reports
-
-### 5. Node.js Real-time Service (Priority: HIGH)
-
-**Files needed:**
-```
-realtime-service/
-├── package.json
-├── Dockerfile
-├── .env.example
-├── src/
-│   ├── server.js - Main Express server
-│   ├── config/
-│   │   └── index.js - Configuration
-│   ├── websocket/
-│   │   ├── handler.js - WebSocket connection handling
-│   │   └── events.js - Event definitions
-│   ├── webrtc/
-│   │   └── signaling.js - WebRTC signaling logic
-│   ├── chat/
-│   │   └── service.js - Chat service
-│   ├── auth/
-│   │   └── middleware.js - JWT verification
-│   └── utils/
-│       ├── redis.js - Redis pub/sub
-│       └── logger.js - Logging utility
-```
-
-**Key features:**
-- Socket.io for WebSocket connections
-- WebRTC signaling (offer/answer/ICE)
-- Chat message handling
-- Presence management
-- Redis pub/sub for scaling
-
-### 6. Next.js Patient Portal (Priority: HIGH)
-
-**Files needed:**
-```
-patient-portal/
-├── package.json
-├── Dockerfile
-├── next.config.js
-├── tailwind.config.js
-├── src/
-│   ├── app/
-│   │   ├── layout.tsx - Root layout
-│   │   ├── page.tsx - Landing page
-│   │   ├── login/page.tsx
-│   │   ├── register/page.tsx
-│   │   ├── dashboard/page.tsx
-│   │   ├── appointments/
-│   │   │   ├── page.tsx - List appointments
-│   │   │   └── book/page.tsx - Book appointment
-│   │   ├── consultation/[id]/page.tsx
-│   │   ├── medical-records/page.tsx
-│   │   ├── prescriptions/page.tsx
-│   │   └── profile/page.tsx
-│   ├── components/
-│   │   ├── VideoCall.tsx - WebRTC video
-│   │   ├── Chat.tsx - Chat interface
-│   │   ├── AppointmentCard.tsx
-│   │   ├── DoctorCard.tsx
-│   │   └── Layout/
-│   │       ├── Header.tsx
-│   │       ├── Footer.tsx
-│   │       └── Sidebar.tsx
-│   ├── lib/
-│   │   ├── api.ts - API client
-│   │   ├── websocket.ts - WebSocket client
-│   │   ├── webrtc.ts - WebRTC utilities
-│   │   └── auth.ts - Auth utilities
-│   └── styles/
-│       └── globals.css
-```
-
-### 7. React Doctor Dashboard (Priority: HIGH)
-
-**Files needed:**
-```
-doctor-dashboard/
-├── package.json
-├── Dockerfile
-├── vite.config.ts
-├── tailwind.config.js
-├── src/
-│   ├── main.tsx
-│   ├── App.tsx
-│   ├── pages/
-│   │   ├── Dashboard.tsx
-│   │   ├── Appointments.tsx
-│   │   ├── Patients.tsx
-│   │   ├── PatientDetail.tsx
-│   │   ├── Consultation.tsx
-│   │   ├── Prescriptions.tsx
-│   │   └── Profile.tsx
-│   ├── components/
-│   │   ├── VideoCall.tsx
-│   │   ├── Chat.tsx
-│   │   ├── PatientHistory.tsx
-│   │   ├── PrescriptionForm.tsx
-│   │   ├── AppointmentCalendar.tsx
-│   │   └── Layout/
-│   ├── services/
-│   │   ├── api.ts
-│   │   ├── websocket.ts
-│   │   └── webrtc.ts
-│   ├── store/
-│   │   └── index.ts - Zustand store
-│   └── styles/
-│       └── index.css
-```
-
-## 📋 Implementation Roadmap
-
-### Phase 1: Complete Backend (Week 1-2)
-1. ✅ Users app (DONE)
-2. ⏳ Appointments app
-3. ⏳ Consultations app
-4. ⏳ Medical Records app
-5. ⏳ Audit app
-
-### Phase 2: Real-time Service (Week 2-3)
-1. ⏳ Node.js server setup
-2. ⏳ WebSocket implementation
-3. ⏳ WebRTC signaling
-4. ⏳ Chat service
-5. ⏳ Redis pub/sub
-
-### Phase 3: Patient Portal (Week 3-4)
-1. ⏳ Next.js setup
-2. ⏳ Authentication pages
-3. ⏳ Dashboard and appointments
-4. ⏳ Video consultation interface
-5. ⏳ Medical records view
-
-### Phase 4: Doctor Dashboard (Week 4-5)
-1. ⏳ React/Vite setup
-2. ⏳ Doctor dashboard
-3. ⏳ Patient management
-4. ⏳ Consultation interface
-5. ⏳ Prescription management
-
-### Phase 5: Testing & Deployment (Week 5-6)
-1. ⏳ Unit tests
-2. ⏳ Integration tests
-3. ⏳ E2E tests
-4. ⏳ Security audit
-5. ⏳ Production deployment
-
-## 🚀 Next Steps
-
-### Immediate Actions:
-
-1. **Create placeholder __init__.py files** for remaining apps:
-   ```bash
-   mkdir -p backend/apps/appointments
-   mkdir -p backend/apps/consultations
-   mkdir -p backend/apps/medical_records
-   mkdir -p backend/apps/audit
-   touch backend/apps/appointments/__init__.py
-   touch backend/apps/consultations/__init__.py
-   touch backend/apps/medical_records/__init__.py
-   touch backend/apps/audit/__init__.py
-   ```
-
-2. **Test the Users app**:
-   ```bash
-   cd backend
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
-   python manage.py makemigrations
-   python manage.py migrate
-   python manage.py createsuperuser
-   python manage.py runserver
-   ```
-
-3. **Test API endpoints** using the Swagger docs:
-   - Navigate to http://localhost:8000/api/docs/
-   - Test registration, login, and profile endpoints
-
-4. **Build remaining apps** following the same pattern as Users app
-
-5. **Implement Node.js service** for real-time features
-
-6. **Build frontends** with modern UI/UX
-
-## 📊 Current Progress
-
-- **Documentation**: 100% ✅
-- **Infrastructure**: 100% ✅
-- **Django Backend**: 20% 🚧
-  - Users App: 100% ✅
-  - Appointments App: 0% ⏳
-  - Consultations App: 0% ⏳
-  - Medical Records App: 0% ⏳
-  - Audit App: 0% ⏳
-- **Node.js Service**: 0% ⏳
-- **Patient Portal**: 0% ⏳
-- **Doctor Dashboard**: 0% ⏳
-
-## 🎯 Success Criteria
-
-- [ ] All backend apps implemented with tests
-- [ ] Real-time video consultations working
-- [ ] Secure medical record management
-- [ ] Complete audit trail
-- [ ] Mobile-responsive frontends
-- [ ] Production deployment ready
-- [ ] Security audit passed
-- [ ] Documentation complete
-
----
-
-**This is a solid foundation!** The Users app is production-ready and demonstrates the pattern for building the remaining apps. The architecture is scalable, secure, and follows best practices.
+- Prefer extending existing app patterns rather than adding new service boundaries.
+- Keep clinical data access explicit and covered by tests.
+- Treat the generated Swagger docs as the source of truth for request/response details once the backend is running.
+- Update this guide whenever an endpoint, service, or milestone changes.
