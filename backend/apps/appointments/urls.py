@@ -1,8 +1,13 @@
-"""
-Appointments app URLs.
-"""
-from django.urls import path
+"""Appointments app URLs."""
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from .views import AppointmentViewSet, DoctorAvailabilityViewSet
+
+router = DefaultRouter()
+router.register(r'availability', DoctorAvailabilityViewSet, basename='doctor-availability')
+router.register(r'', AppointmentViewSet, basename='appointment')
 
 urlpatterns = [
-    # Appointments endpoints will be added here
+    path('', include(router.urls)),
 ]

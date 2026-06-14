@@ -12,6 +12,6 @@ class UsersConfig(AppConfig):
     def ready(self):
         """Import signals when app is ready."""
         try:
-            import apps.users.signals  # noqa
+            from . import signals  # noqa
         except ImportError:
             pass

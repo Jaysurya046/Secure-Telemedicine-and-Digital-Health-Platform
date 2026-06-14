@@ -197,8 +197,12 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
         
         # Update user profile
         if 'profile' in request.data:
+            profile, _ = UserProfile.objects.get_or_create(
+                user=user,
+                defaults={'first_name': '', 'last_name': ''}
+            )
             profile_serializer = UpdateProfileSerializer(
-                user.profile,
+                profile,
                 data=request.data['profile'],
                 partial=True
             )
@@ -207,8 +211,15 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
         
         # Update doctor profile if doctor
         if user.is_doctor and 'doctor_profile' in request.data:
+            doctor_profile, _ = DoctorProfile.objects.get_or_create(
+                user=user,
+                defaults={
+                    'specialization': request.data['doctor_profile'].get('specialization', 'General Medicine'),
+                    'license_number': request.data['doctor_profile'].get('license_number', f'PENDING-{user.id}'),
+                }
+            )
             doctor_profile_serializer = UpdateDoctorProfileSerializer(
-                user.doctor_profile,
+                doctor_profile,
                 data=request.data['doctor_profile'],
                 partial=True
             )
@@ -217,8 +228,9 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
         
         # Update medical info if patient
         if user.is_patient and 'medical_info' in request.data:
+            medical_info, _ = PatientMedicalInfo.objects.get_or_create(user=user)
             medical_info_serializer = UpdateMedicalInfoSerializer(
-                user.medical_info,
+                medical_info,
                 data=request.data['medical_info'],
                 partial=True
             )

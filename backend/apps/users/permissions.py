@@ -1,7 +1,7 @@
 """
 Custom permissions for Telemedicine Platform.
 """
-from rest_framework import permissions
+from rest_framework import permissions  # type: ignore[import]
 
 
 class IsOwnerOrAdmin(permissions.BasePermission):

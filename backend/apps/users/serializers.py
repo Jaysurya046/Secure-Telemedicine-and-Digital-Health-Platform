@@ -83,12 +83,17 @@ class RegisterSerializer(serializers.ModelSerializer):
     first_name = serializers.CharField(required=True)
     last_name = serializers.CharField(required=True)
     phone = serializers.CharField(required=False, allow_blank=True)
+    specialization = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    license_number = serializers.CharField(required=False, allow_blank=True, write_only=True)
+    years_of_experience = serializers.IntegerField(required=False, write_only=True, min_value=0)
+    consultation_fee = serializers.DecimalField(required=False, write_only=True, max_digits=10, decimal_places=2)
     
     class Meta:
         model = User
         fields = [
             'email', 'password', 'password_confirm', 'role',
-            'first_name', 'last_name', 'phone'
+            'first_name', 'last_name', 'phone', 'specialization',
+            'license_number', 'years_of_experience', 'consultation_fee'
         ]
     
     def validate(self, attrs):
@@ -97,6 +102,14 @@ class RegisterSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "password": "Password fields didn't match."
             })
+        if attrs.get('role') == 'doctor':
+            required = ['specialization', 'license_number']
+            missing = [field for field in required if not attrs.get(field)]
+            if missing:
+                raise serializers.ValidationError({
+                    field: 'This field is required for doctor registration.'
+                    for field in missing
+                })
         return attrs
     
     def validate_role(self, value):
@@ -114,6 +127,10 @@ class RegisterSerializer(serializers.ModelSerializer):
         first_name = validated_data.pop('first_name')
         last_name = validated_data.pop('last_name')
         phone = validated_data.pop('phone', '')
+        specialization = validated_data.pop('specialization', '')
+        license_number = validated_data.pop('license_number', '')
+        years_of_experience = validated_data.pop('years_of_experience', 0)
+        consultation_fee = validated_data.pop('consultation_fee', 0)
         
         # Create user
         user = User.objects.create_user(**validated_data)
@@ -129,6 +146,14 @@ class RegisterSerializer(serializers.ModelSerializer):
         # Create medical info for patients
         if user.role == 'patient':
             PatientMedicalInfo.objects.create(user=user)
+        elif user.role == 'doctor':
+            DoctorProfile.objects.create(
+                user=user,
+                specialization=specialization,
+                license_number=license_number,
+                years_of_experience=years_of_experience,
+                consultation_fee=consultation_fee,
+            )
         
         return user
 

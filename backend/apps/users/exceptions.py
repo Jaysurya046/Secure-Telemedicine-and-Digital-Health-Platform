@@ -1,9 +1,9 @@
 """
 Custom exception handler for API responses.
 """
-from rest_framework.views import exception_handler
-from rest_framework.response import Response
-from rest_framework import status
+from rest_framework.views import exception_handler  # type: ignore[import]
+from rest_framework.response import Response  # type: ignore[import]
+from rest_framework import status  # type: ignore[import]
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.http import Http404
 import logging
