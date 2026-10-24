@@ -14,7 +14,9 @@ export function Consultation({ roomId }: { roomId: string }) {
     connection.emit('consultation:join', { roomId });
     connection.on('chat:message', (message) => setMessages((current) => [...current, message]));
     setSocket(connection);
-    return () => connection.disconnect();
+    return () => {
+      connection.disconnect();
+    };
   }, [roomId]);
 
   function send() {
