@@ -7,12 +7,13 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 
 from .models import Appointment, DoctorAvailability
+from .permissions import AppointmentAccessPermission
 from .serializers import AppointmentSerializer, DoctorAvailabilitySerializer
 
 
 class AppointmentViewSet(viewsets.ModelViewSet):
     serializer_class = AppointmentSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, AppointmentAccessPermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter, filters.SearchFilter]
     filterset_fields = ['status', 'doctor', 'patient']
     ordering_fields = ['scheduled_start', 'created_at']
@@ -21,22 +22,28 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        if not (user and user.is_authenticated):
+            return Appointment.objects.none()
+
         queryset = Appointment.objects.select_related(
             'patient', 'patient__profile', 'doctor', 'doctor__profile', 'doctor__doctor_profile'
         )
-        if user.role == 'admin':
+        role = getattr(user, 'role', None)
+        if role == 'admin':
             return queryset
-        if user.role == 'doctor':
+        if role == 'doctor':
             return queryset.filter(doctor=user)
-        return queryset.filter(patient=user)
+        if role == 'patient':
+            return queryset.filter(patient=user)
+        return Appointment.objects.none()
 
     def perform_create(self, serializer):
         if self.request.user.role == 'patient':
-            serializer.save(patient=self.request.user)
+            serializer.save(patient=self.request.user, status='pending')
         elif self.request.user.role == 'doctor':
-            serializer.save(doctor=self.request.user)
+            serializer.save(doctor=self.request.user, status='pending')
         else:
-            serializer.save()
+            serializer.save(status='pending')
 
     @action(detail=True, methods=['post'])
     def confirm(self, request, pk=None):
