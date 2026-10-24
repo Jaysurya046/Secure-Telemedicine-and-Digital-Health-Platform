@@ -11,7 +11,8 @@ Covers:
 - Deny unsupported roles and unauthenticated callers; participant-scoped access preserved.
 - Patient portal actual booking payload, malformed bodies, and DB immutability after rejection.
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
+from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.urls import reverse
 from django.utils import timezone
@@ -2348,5 +2349,397 @@ class DoctorAvailabilitySecurityTests(BaseAppointmentTestCase):
         idx_w2 = ids_doc.index(str(w2.id))
         idx_w1 = ids_doc.index(str(w1.id))
         self.assertLess(idx_w2, idx_w1)
+
+
+class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
+    """
+    Tests for Feature 4D: Reject past bookings and protect appointment rescheduling.
+
+    Covers:
+    - New appointments must have scheduled_start strictly later than timezone.now().
+    - Deterministic tests with a fixed clock for past/equal/future starts.
+    - Preserve scheduled_end > scheduled_start and doctor-overlap validation.
+    - Distinguish actual datetime changes from unchanged values on PUT/PATCH.
+    - Allow datetime changes only while the appointment is pending.
+    - Reject datetime changes on confirmed, completed, cancelled, or no_show appointments with 400.
+    - Rescheduling must produce a future start time.
+    - Partial updates using effective existing values.
+    - Unchanged timestamps remain acceptable, including equivalent timestamps expressed with different UTC offsets.
+    - Unrelated updates to historical appointments must not fail merely because their existing start time is in the past.
+    - All rejected requests leave the database row unchanged.
+    """
+
+    FIXED_NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+
+    def test_new_appointment_deterministic_past_equal_future_starts(self):
+        """New appointments require scheduled_start strictly later than timezone.now()."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. Past start (1 minute before fixed now) -> 400
+            initial_count = Appointment.objects.count()
+            res_past = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': (self.FIXED_NOW - timedelta(minutes=1)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(hours=1)).isoformat(),
+                    'reason': 'Past booking attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res_past.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_past))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+            # 2. Equal start (exactly fixed now) -> 400 (must be strictly later)
+            res_equal = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': self.FIXED_NOW.isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(hours=1)).isoformat(),
+                    'reason': 'Equal booking attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res_equal.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_equal))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+            # 3. Future start (1 minute strictly after fixed now) -> 201
+            res_future = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': (self.FIXED_NOW + timedelta(minutes=1)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(hours=1)).isoformat(),
+                    'reason': 'Future booking success',
+                },
+                format='json',
+            )
+            self.assertEqual(res_future.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Appointment.objects.count(), initial_count + 1)
+            created_appt = Appointment.objects.get(id=res_future.data['id'])
+            self.assertEqual(created_appt.status, 'pending')
+
+    def test_rescheduling_deterministic_past_equal_future_starts(self):
+        """Rescheduling requires a future start time strictly later than timezone.now()."""
+        # Create pending appointment in the future relative to FIXED_NOW
+        appt = Appointment.objects.create(
+            patient=self.patient_1,
+            doctor=self.doctor_1,
+            scheduled_start=self.FIXED_NOW + timedelta(days=2),
+            scheduled_end=self.FIXED_NOW + timedelta(days=2, hours=1),
+            status='pending',
+            reason='Original appointment',
+        )
+        appt.refresh_from_db()
+        initial_updated_at = appt.updated_at
+
+        self.client.force_authenticate(user=self.patient_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. Reschedule to past start -> 400
+            res_past = self.client.patch(
+                self.detail_url(appt.id),
+                {
+                    'scheduled_start': (self.FIXED_NOW - timedelta(hours=1)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(hours=1)).isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res_past.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_past))
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, self.FIXED_NOW + timedelta(days=2))
+            self.assertEqual(appt.updated_at, initial_updated_at)
+
+            # 2. Reschedule to equal start -> 400
+            res_equal = self.client.patch(
+                self.detail_url(appt.id),
+                {
+                    'scheduled_start': self.FIXED_NOW.isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(hours=1)).isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res_equal.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_equal))
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, self.FIXED_NOW + timedelta(days=2))
+            self.assertEqual(appt.updated_at, initial_updated_at)
+
+            # 3. Reschedule to future start -> 200
+            new_start = self.FIXED_NOW + timedelta(days=5)
+            new_end = self.FIXED_NOW + timedelta(days=5, hours=1)
+            res_future = self.client.patch(
+                self.detail_url(appt.id),
+                {
+                    'scheduled_start': new_start.isoformat(),
+                    'scheduled_end': new_end.isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res_future.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, new_start)
+            self.assertEqual(appt.scheduled_end, new_end)
+
+    def test_rescheduling_rejected_on_non_pending_statuses(self):
+        """Reject datetime changes on confirmed, completed, cancelled, or no_show appointments with 400."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        non_pending_statuses = ['confirmed', 'completed', 'cancelled', 'no_show']
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            for bad_status in non_pending_statuses:
+                with self.subTest(status=bad_status):
+                    appt = Appointment.objects.create(
+                        patient=self.patient_1,
+                        doctor=self.doctor_1,
+                        scheduled_start=self.FIXED_NOW + timedelta(days=2),
+                        scheduled_end=self.FIXED_NOW + timedelta(days=2, hours=1),
+                        status=bad_status,
+                        reason=f'Appointment with {bad_status}',
+                    )
+                    appt.refresh_from_db()
+                    initial_updated_at = appt.updated_at
+
+                    # Attempt to reschedule start time to future
+                    new_start = self.FIXED_NOW + timedelta(days=10)
+                    new_end = self.FIXED_NOW + timedelta(days=10, hours=1)
+                    res = self.client.patch(
+                        self.detail_url(appt.id),
+                        {
+                            'scheduled_start': new_start.isoformat(),
+                            'scheduled_end': new_end.isoformat(),
+                        },
+                        format='json',
+                    )
+                    self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+                    self.assertIn('Cannot reschedule', str(res.data))
+
+                    # Verify row remains completely unchanged
+                    appt.refresh_from_db()
+                    self.assertEqual(appt.status, bad_status)
+                    self.assertEqual(appt.scheduled_start, self.FIXED_NOW + timedelta(days=2))
+                    self.assertEqual(appt.scheduled_end, self.FIXED_NOW + timedelta(days=2, hours=1))
+                    self.assertEqual(appt.updated_at, initial_updated_at)
+
+    def test_partial_updates_use_effective_existing_values(self):
+        """Partial updates (PATCH) use effective existing values for validation."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # Baseline: Day 2 from 10:00 to 11:00
+            start_dt = self.FIXED_NOW + timedelta(days=2, hours=10)
+            end_dt = self.FIXED_NOW + timedelta(days=2, hours=11)
+            appt = Appointment.objects.create(
+                patient=self.patient_1,
+                doctor=self.doctor_1,
+                scheduled_start=start_dt,
+                scheduled_end=end_dt,
+                status='pending',
+            )
+
+            # 1. Update only scheduled_start to 10:30 (valid since 10:30 < existing end 11:00)
+            res1 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_start': (start_dt + timedelta(minutes=30)).isoformat()},
+                format='json',
+            )
+            self.assertEqual(res1.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, start_dt + timedelta(minutes=30))
+            self.assertEqual(appt.scheduled_end, end_dt)
+
+            # 2. Update only scheduled_start to 12:00 (invalid since 12:00 >= existing end 11:00)
+            res2 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_start': (self.FIXED_NOW + timedelta(days=2, hours=12)).isoformat()},
+                format='json',
+            )
+            self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_end', self.get_error_details(res2))
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, start_dt + timedelta(minutes=30))
+
+            # 3. Update only scheduled_end to 12:00 (valid since 12:00 > existing start 10:30)
+            res3 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_end': (self.FIXED_NOW + timedelta(days=2, hours=12)).isoformat()},
+                format='json',
+            )
+            self.assertEqual(res3.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_end, self.FIXED_NOW + timedelta(days=2, hours=12))
+
+            # 4. Partial update of scheduled_end on a pending appointment with past start time fails
+            past_start = self.FIXED_NOW - timedelta(days=1)
+            past_appt = Appointment.objects.create(
+                patient=self.patient_1,
+                doctor=self.doctor_1,
+                scheduled_start=past_start,
+                scheduled_end=past_start + timedelta(hours=1),
+                status='pending',
+            )
+            res4 = self.client.patch(
+                self.detail_url(past_appt.id),
+                {'scheduled_end': (self.FIXED_NOW + timedelta(hours=2)).isoformat()},
+                format='json',
+            )
+            self.assertEqual(res4.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res4))
+            past_appt.refresh_from_db()
+            self.assertEqual(past_appt.scheduled_start, past_start)
+
+    def test_unchanged_timestamps_and_different_utc_offsets_accepted(self):
+        """Unchanged timestamps are accepted, including different UTC offset representations."""
+        # Baseline appointment
+        start_utc = datetime(2026, 11, 10, 10, 0, 0, tzinfo=dt_timezone.utc)
+        end_utc = datetime(2026, 11, 10, 11, 0, 0, tzinfo=dt_timezone.utc)
+
+        # Confirmed appointment (where rescheduling would normally be rejected)
+        appt = Appointment.objects.create(
+            patient=self.patient_1,
+            doctor=self.doctor_1,
+            scheduled_start=start_utc,
+            scheduled_end=end_utc,
+            status='confirmed',
+            reason='Original reason',
+        )
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # Equivalent timestamp in UTC+05:30 (10:00 UTC == 15:30 +05:30)
+            offset_start = '2026-11-10T15:30:00+05:30'
+            offset_end = '2026-11-10T16:30:00+05:30'
+
+            # Full PUT with offset-equivalent timestamps on confirmed appointment
+            res_put = self.client.put(
+                self.detail_url(appt.id),
+                {
+                    'patient': str(self.patient_1.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': offset_start,
+                    'scheduled_end': offset_end,
+                    'reason': 'Updated reason with same time',
+                },
+                format='json',
+            )
+            self.assertEqual(res_put.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, start_utc)
+            self.assertEqual(appt.scheduled_end, end_utc)
+            self.assertEqual(appt.reason, 'Updated reason with same time')
+            self.assertEqual(appt.status, 'confirmed')
+
+            # PATCH with same UTC representation
+            res_patch = self.client.patch(
+                self.detail_url(appt.id),
+                {
+                    'scheduled_start': start_utc.isoformat(),
+                    'reason': 'Patched reason with same time',
+                },
+                format='json',
+            )
+            self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, start_utc)
+            self.assertEqual(appt.reason, 'Patched reason with same time')
+
+    def test_unrelated_updates_to_historical_appointments_succeed(self):
+        """Unrelated updates to historical appointments do not fail merely because start is in past."""
+        past_start = self.FIXED_NOW - timedelta(days=60)
+        past_end = self.FIXED_NOW - timedelta(days=60, hours=-1)
+
+        # Historical completed appointment
+        hist_appt = Appointment.objects.create(
+            patient=self.patient_1,
+            doctor=self.doctor_1,
+            scheduled_start=past_start,
+            scheduled_end=past_end,
+            status='completed',
+            notes='Initial clinical notes',
+        )
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. PATCH unrelated field 'notes'
+            res_patch = self.client.patch(
+                self.detail_url(hist_appt.id),
+                {'notes': 'Updated addendum to historical consultation'},
+                format='json',
+            )
+            self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+            hist_appt.refresh_from_db()
+            self.assertEqual(hist_appt.notes, 'Updated addendum to historical consultation')
+            self.assertEqual(hist_appt.scheduled_start, past_start)
+            self.assertEqual(hist_appt.status, 'completed')
+
+            # 2. PUT with unchanged historical past timestamps
+            res_put = self.client.put(
+                self.detail_url(hist_appt.id),
+                {
+                    'patient': str(self.patient_1.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': past_start.isoformat(),
+                    'scheduled_end': past_end.isoformat(),
+                    'notes': 'Final historical note',
+                    'reason': 'Checkup',
+                },
+                format='json',
+            )
+            self.assertEqual(res_put.status_code, status.HTTP_200_OK)
+            hist_appt.refresh_from_db()
+            self.assertEqual(hist_appt.notes, 'Final historical note')
+            self.assertEqual(hist_appt.scheduled_start, past_start)
+
+    def test_doctor_conflict_and_end_after_start_validation_preserved(self):
+        """Preserve scheduled_end > scheduled_start and doctor-overlap validation."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. scheduled_end <= scheduled_start on creation
+            res_end_before = self.client.post(
+                self.list_url,
+                {
+                    'patient': str(self.patient_1.id),
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=1, hours=2)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=1, hours=1)).isoformat(),
+                    'reason': 'Invalid end before start',
+                },
+                format='json',
+            )
+            self.assertEqual(res_end_before.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_end', self.get_error_details(res_end_before))
+
+            # 2. Conflicting appointment window for doctor
+            Appointment.objects.create(
+                patient=self.patient_1,
+                doctor=self.doctor_1,
+                scheduled_start=self.FIXED_NOW + timedelta(days=3, hours=10),
+                scheduled_end=self.FIXED_NOW + timedelta(days=3, hours=11),
+                status='confirmed',
+                reason='Existing confirmed booking',
+            )
+
+            # Try to book overlapping window for same doctor
+            res_overlap = self.client.post(
+                self.list_url,
+                {
+                    'patient': str(self.patient_2.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=3, hours=10, minutes=30)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=3, hours=11, minutes=30)).isoformat(),
+                    'reason': 'Overlapping booking',
+                },
+                format='json',
+            )
+            self.assertEqual(res_overlap.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('already has an appointment', str(res_overlap.data))
+
 
 

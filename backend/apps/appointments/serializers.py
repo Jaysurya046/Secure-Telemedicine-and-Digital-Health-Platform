@@ -1,6 +1,7 @@
 """Serializers for appointment scheduling."""
 from collections.abc import Mapping
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.users.serializers import DoctorListSerializer, PatientListSerializer
@@ -87,6 +88,13 @@ class AppointmentSerializer(serializers.ModelSerializer):
             if not attrs.get('doctor'):
                 raise serializers.ValidationError({'doctor': 'Doctor is required.'})
 
+            # New appointments must have scheduled_start strictly later than timezone.now().
+            scheduled_start = attrs.get('scheduled_start')
+            if scheduled_start and scheduled_start <= timezone.now():
+                raise serializers.ValidationError({
+                    'scheduled_start': 'Scheduled start time must be in the future.'
+                })
+
             # Every new appointment starts as pending. Reject supplied non-pending status.
             if hasattr(self, 'initial_data') and 'status' in self.initial_data:
                 supplied_status = self.initial_data.get('status')
@@ -124,6 +132,32 @@ class AppointmentSerializer(serializers.ModelSerializer):
                         })
 
             attrs.pop('status', None)
+
+            # Distinguish actual datetime changes from unchanged values.
+            start_changed = False
+            if 'scheduled_start' in attrs:
+                start_changed = (attrs['scheduled_start'] != self.instance.scheduled_start)
+
+            end_changed = False
+            if 'scheduled_end' in attrs:
+                end_changed = (attrs['scheduled_end'] != self.instance.scheduled_end)
+
+            is_rescheduling = start_changed or end_changed
+
+            if is_rescheduling:
+                # Allow datetime changes only while the appointment is pending.
+                # Reject datetime changes on confirmed, completed, cancelled, or no_show appointments with HTTP 400.
+                if self.instance.status != 'pending':
+                    err_msg = f"Cannot reschedule appointment with status '{self.instance.status}'. Only pending appointments can be rescheduled."
+                    err_field = 'scheduled_start' if start_changed else 'scheduled_end'
+                    raise serializers.ValidationError({err_field: err_msg})
+
+                # Rescheduling must produce a future start time.
+                effective_start = attrs.get('scheduled_start', self.instance.scheduled_start)
+                if effective_start and effective_start <= timezone.now():
+                    raise serializers.ValidationError({
+                        'scheduled_start': 'Scheduled start time must be in the future.'
+                    })
 
         # Existing time and conflict validation
         scheduled_start = attrs.get('scheduled_start', getattr(self.instance, 'scheduled_start', None))
