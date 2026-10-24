@@ -61,6 +61,11 @@ REDIS_PASSWORD=redis_password_here
 JWT_SECRET_KEY=jwt-secret-key-change-in-production
 JWT_ACCESS_TOKEN_LIFETIME=15  # minutes
 JWT_REFRESH_TOKEN_LIFETIME=10080  # 7 days in minutes
+# Note: Both Django backend and Node.js realtime-service use a unified resolution policy:
+# 1. Non-empty JWT_SECRET_KEY is used as the signing/verifying key.
+# 2. If JWT_SECRET_KEY is blank or omitted, services fall back to DJANGO_SECRET_KEY.
+# 3. If both are blank or omitted, services fall back to the default insecure development key.
+# Docker Compose forwards both DJANGO_SECRET_KEY and JWT_SECRET_KEY to all backend, celery, and realtime services.
 
 # Email Configuration
 EMAIL_HOST=smtp.gmail.com

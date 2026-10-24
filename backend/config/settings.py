@@ -12,7 +12,8 @@ import dj_database_url
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('DJANGO_SECRET_KEY', default='django-insecure-change-this-in-production')
+_raw_django_secret = config('DJANGO_SECRET_KEY', default='django-insecure-change-this-in-production')
+SECRET_KEY = _raw_django_secret.strip() if _raw_django_secret and _raw_django_secret.strip() else 'django-insecure-change-this-in-production'
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = config('DJANGO_DEBUG', default=True, cast=bool)
@@ -171,6 +172,13 @@ REST_FRAMEWORK = {
 }
 
 # JWT Settings
+# Unified resolution policy across services:
+# 1. JWT_SECRET_KEY if non-empty (trimmed).
+# 2. DJANGO_SECRET_KEY if non-empty (trimmed).
+# 3. Fallback to default development key ('django-insecure-change-this-in-production').
+_raw_jwt_secret = config('JWT_SECRET_KEY', default=None)
+JWT_SIGNING_KEY = _raw_jwt_secret.strip() if _raw_jwt_secret and _raw_jwt_secret.strip() else SECRET_KEY
+
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=config('JWT_ACCESS_TOKEN_LIFETIME', default=15, cast=int)),
     'REFRESH_TOKEN_LIFETIME': timedelta(minutes=config('JWT_REFRESH_TOKEN_LIFETIME', default=10080, cast=int)),
@@ -178,7 +186,7 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': config('JWT_SECRET_KEY', default=SECRET_KEY),
+    'SIGNING_KEY': JWT_SIGNING_KEY,
     'VERIFYING_KEY': None,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'AUTH_HEADER_NAME': 'HTTP_AUTHORIZATION',
