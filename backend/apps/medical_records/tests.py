@@ -6,6 +6,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory
 
+from apps.consultations.models import Consultation
 from apps.medical_records.models import MedicalRecord, Prescription, PrescriptionItem
 from apps.medical_records.permissions import ClinicalRecordPermission
 
@@ -125,6 +126,12 @@ class BaseClinicalAccessTestCase(APITestCase):
 
     def prescription_cancel_url(self, pk):
         return reverse('prescription-cancel', kwargs={'pk': pk})
+
+    def get_error_details(self, response):
+        """Helper to extract field errors from standard or custom DRF responses."""
+        if isinstance(response.data, dict) and 'details' in response.data:
+            return response.data['details']
+        return response.data
 
 
 class PatientClinicalWritePermissionTests(BaseClinicalAccessTestCase):
@@ -745,3 +752,436 @@ class ClinicalRecordPermissionUnitTests(BaseClinicalAccessTestCase):
         # Other patient's object
         self.assertFalse(self.permission.has_object_permission(req_pat_get, None, self.record_doc2_pat2))
         self.assertFalse(self.permission.has_object_permission(req_pat_put, None, self.record_doc2_pat2))
+
+
+class ClinicalOwnershipAndReferenceProtectionTests(BaseClinicalAccessTestCase):
+    """
+    Feature 3B tests: Protect clinical ownership and related references.
+    Covers:
+    - On doctor creation, derive doctor from authenticated user before validation.
+    - Omitting doctor must work; supplying another doctor must be rejected.
+    - Admin creation validates author's doctor role.
+    - Patient references must identify users with the patient role.
+    - After creation, patient and doctor are immutable through PUT/PATCH (including admin).
+    - Consultation must match effective patient and doctor; preserves nullable behavior.
+    - Partial updates and unchanged patient/doctor values accepted.
+    - Invalid requests leave records and prescription items unchanged.
+    """
+
+    def test_doctor_create_medical_record_spoofed_doctor_rejected(self):
+        """Doctor 1 attempting to create record with Doctor 2 as author is rejected with 400."""
+        self.client.force_authenticate(user=self.doctor_1)
+        initial_count = MedicalRecord.objects.count()
+        payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.doctor_2.id),
+            'record_type': 'consultation',
+            'title': 'Spoofed Doctor Record',
+            'description': 'Attempting author spoofing',
+        }
+        response = self.client.post(self.record_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+        self.assertEqual(MedicalRecord.objects.count(), initial_count)
+        self.assertFalse(MedicalRecord.objects.filter(title='Spoofed Doctor Record').exists())
+
+    def test_doctor_create_prescription_spoofed_doctor_rejected(self):
+        """Doctor 1 attempting to create prescription with Doctor 2 as author is rejected with 400."""
+        self.client.force_authenticate(user=self.doctor_1)
+        initial_rx_count = Prescription.objects.count()
+        initial_item_count = PrescriptionItem.objects.count()
+        payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.doctor_2.id),
+            'instructions': 'Spoofed Doctor Prescription',
+            'items': [
+                {
+                    'medication_name': 'SpoofMed',
+                    'dosage': '10mg',
+                    'frequency': 'once daily',
+                    'duration': '5 days',
+                }
+            ],
+        }
+        response = self.client.post(self.prescription_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+        self.assertEqual(Prescription.objects.count(), initial_rx_count)
+        self.assertEqual(PrescriptionItem.objects.count(), initial_item_count)
+        self.assertFalse(Prescription.objects.filter(instructions='Spoofed Doctor Prescription').exists())
+
+    def test_doctor_create_medical_record_omitting_doctor_succeeds(self):
+        """Doctor 1 creates medical record omitting doctor; doctor is derived before validation."""
+        self.client.force_authenticate(user=self.doctor_1)
+        payload = {
+            'patient': str(self.patient_1.id),
+            'record_type': 'consultation',
+            'title': 'Record Without Explicit Doctor',
+            'description': 'Doctor field omitted by client',
+        }
+        response = self.client.post(self.record_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_record = MedicalRecord.objects.get(id=response.data['id'])
+        self.assertEqual(created_record.doctor, self.doctor_1)
+        self.assertEqual(created_record.patient, self.patient_1)
+
+    def test_doctor_create_prescription_omitting_doctor_succeeds(self):
+        """Doctor 1 creates prescription omitting doctor; doctor is derived before validation."""
+        self.client.force_authenticate(user=self.doctor_1)
+        payload = {
+            'patient': str(self.patient_1.id),
+            'instructions': 'Prescription without explicit doctor',
+            'items': [
+                {
+                    'medication_name': 'DerivedMed',
+                    'dosage': '50mg',
+                    'frequency': '2x daily',
+                    'duration': '14 days',
+                }
+            ],
+        }
+        response = self.client.post(self.prescription_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_rx = Prescription.objects.get(id=response.data['id'])
+        self.assertEqual(created_rx.doctor, self.doctor_1)
+        self.assertEqual(created_rx.patient, self.patient_1)
+        self.assertEqual(created_rx.items.count(), 1)
+        self.assertEqual(created_rx.items.first().medication_name, 'DerivedMed')
+
+    def test_admin_create_medical_record_omitting_doctor_preserves_nullable(self):
+        """Admin can create a medical record omitting doctor; doctor remains null."""
+        self.client.force_authenticate(user=self.admin)
+        payload = {
+            'patient': str(self.patient_1.id),
+            'record_type': 'lab',
+            'title': 'Admin Lab Record No Doctor',
+            'description': 'Created by admin without doctor',
+        }
+        response = self.client.post(self.record_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        created_record = MedicalRecord.objects.get(id=response.data['id'])
+        self.assertIsNone(created_record.doctor)
+        self.assertEqual(created_record.patient, self.patient_1)
+
+    def test_admin_create_prescription_omitting_doctor_rejected(self):
+        """Admin creating a prescription without doctor is rejected; doctor is required."""
+        self.client.force_authenticate(user=self.admin)
+        initial_rx_count = Prescription.objects.count()
+        payload = {
+            'patient': str(self.patient_1.id),
+            'instructions': 'Admin prescription missing doctor',
+        }
+        response = self.client.post(self.prescription_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+        self.assertEqual(Prescription.objects.count(), initial_rx_count)
+
+    def test_admin_create_medical_record_wrong_doctor_role_rejected(self):
+        """Admin selecting a non-doctor user (e.g. patient) as doctor is rejected with 400."""
+        self.client.force_authenticate(user=self.admin)
+        initial_count = MedicalRecord.objects.count()
+        payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.patient_2.id),  # patient_2 has role='patient'
+            'record_type': 'consultation',
+            'title': 'Invalid Author Role Record',
+            'description': 'Patient assigned as doctor',
+        }
+        response = self.client.post(self.record_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+        self.assertEqual(MedicalRecord.objects.count(), initial_count)
+
+    def test_admin_create_prescription_wrong_doctor_role_rejected(self):
+        """Admin selecting a non-doctor user as doctor on prescription is rejected with 400."""
+        self.client.force_authenticate(user=self.admin)
+        initial_rx_count = Prescription.objects.count()
+        payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.patient_2.id),  # role='patient'
+            'instructions': 'Invalid doctor role prescription',
+            'items': [{'medication_name': 'TestMed', 'dosage': '5mg', 'frequency': '1x', 'duration': '1d'}],
+        }
+        response = self.client.post(self.prescription_list_url, payload, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+        self.assertEqual(Prescription.objects.count(), initial_rx_count)
+
+    def test_patient_reference_wrong_role_rejected_on_record_and_prescription(self):
+        """Supplying a non-patient user (e.g. doctor or admin) as patient is rejected with 400."""
+        self.client.force_authenticate(user=self.doctor_1)
+        initial_rec_count = MedicalRecord.objects.count()
+        initial_rx_count = Prescription.objects.count()
+
+        # Doctor as patient on record
+        rec_res = self.client.post(self.record_list_url, {
+            'patient': str(self.doctor_2.id),  # role='doctor'
+            'title': 'Doctor as Patient Record',
+            'description': 'Invalid patient reference',
+        }, format='json')
+        self.assertEqual(rec_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(rec_res))
+        self.assertEqual(MedicalRecord.objects.count(), initial_rec_count)
+
+        # Admin as patient on prescription
+        rx_res = self.client.post(self.prescription_list_url, {
+            'patient': str(self.admin.id),  # role='admin'
+            'instructions': 'Admin as Patient Prescription',
+        }, format='json')
+        self.assertEqual(rx_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(rx_res))
+        self.assertEqual(Prescription.objects.count(), initial_rx_count)
+
+    def test_doctor_cannot_reassign_patient_or_doctor_on_record(self):
+        """Doctor cannot reassign patient or doctor on PUT/PATCH; row remains unchanged."""
+        self.client.force_authenticate(user=self.doctor_1)
+        url = self.record_detail_url(self.record_doc1_pat1.id)
+
+        # Attempt to change patient
+        patch_pat = self.client.patch(url, {'patient': str(self.patient_2.id)}, format='json')
+        self.assertEqual(patch_pat.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(patch_pat))
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.patient, self.patient_1)
+
+        # Attempt to change doctor
+        patch_doc = self.client.patch(url, {'doctor': str(self.doctor_2.id)}, format='json')
+        self.assertEqual(patch_doc.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(patch_doc))
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.doctor, self.doctor_1)
+
+    def test_doctor_cannot_reassign_patient_or_doctor_on_prescription(self):
+        """Doctor cannot reassign patient or doctor on prescription; row and items unchanged."""
+        self.client.force_authenticate(user=self.doctor_1)
+        url = self.prescription_detail_url(self.rx_doc1_pat1.id)
+
+        # Attempt to change patient with altered items
+        patch_pat = self.client.patch(url, {
+            'patient': str(self.patient_2.id),
+            'items': [{'medication_name': 'TamperedMed', 'dosage': '99mg', 'frequency': '9x', 'duration': '9d'}],
+        }, format='json')
+        self.assertEqual(patch_pat.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(patch_pat))
+
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.patient, self.patient_1)
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 2)
+        self.assertFalse(PrescriptionItem.objects.filter(medication_name='TamperedMed').exists())
+
+        # Attempt to change doctor
+        patch_doc = self.client.patch(url, {'doctor': str(self.doctor_2.id)}, format='json')
+        self.assertEqual(patch_doc.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(patch_doc))
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.doctor, self.doctor_1)
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 2)
+
+    def test_admin_cannot_reassign_patient_or_doctor_including_after_creation(self):
+        """Admin requests to reassign patient or doctor on PUT/PATCH are rejected with 400."""
+        self.client.force_authenticate(user=self.admin)
+        rec_url = self.record_detail_url(self.record_doc1_pat1.id)
+        rx_url = self.prescription_detail_url(self.rx_doc1_pat1.id)
+
+        # Admin tries to reassign patient on record
+        rec_pat_res = self.client.patch(rec_url, {'patient': str(self.patient_2.id)}, format='json')
+        self.assertEqual(rec_pat_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(rec_pat_res))
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.patient, self.patient_1)
+
+        # Admin tries to reassign doctor on record
+        rec_doc_res = self.client.patch(rec_url, {'doctor': str(self.doctor_2.id)}, format='json')
+        self.assertEqual(rec_doc_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(rec_doc_res))
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.doctor, self.doctor_1)
+
+        # Admin tries to reassign patient on prescription
+        rx_pat_res = self.client.patch(rx_url, {'patient': str(self.patient_2.id)}, format='json')
+        self.assertEqual(rx_pat_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('patient', self.get_error_details(rx_pat_res))
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.patient, self.patient_1)
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 2)
+
+        # Admin tries to reassign doctor on prescription
+        rx_doc_res = self.client.patch(rx_url, {'doctor': str(self.doctor_2.id)}, format='json')
+        self.assertEqual(rx_doc_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(rx_doc_res))
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.doctor, self.doctor_1)
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 2)
+
+    def test_admin_cannot_assign_doctor_to_record_created_without_doctor(self):
+        """Admin cannot assign a doctor to a medical record that was created without one."""
+        self.client.force_authenticate(user=self.admin)
+        rec_no_doc = MedicalRecord.objects.create(
+            patient=self.patient_1,
+            doctor=None,
+            record_type='summary',
+            title='No Doctor Summary',
+            description='Created without a doctor',
+        )
+        url = self.record_detail_url(rec_no_doc.id)
+        response = self.client.patch(url, {'doctor': str(self.doctor_1.id)}, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(response))
+
+        rec_no_doc.refresh_from_db()
+        self.assertIsNone(rec_no_doc.doctor)
+
+    def test_put_and_patch_accept_unchanged_patient_and_doctor(self):
+        """PUT and PATCH requests that supply unchanged patient and doctor values succeed."""
+        self.client.force_authenticate(user=self.doctor_1)
+        rec_url = self.record_detail_url(self.record_doc1_pat1.id)
+        rx_url = self.prescription_detail_url(self.rx_doc1_pat1.id)
+
+        # Full PUT on medical record with unchanged patient and doctor
+        put_rec_payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.doctor_1.id),
+            'record_type': 'consultation',
+            'title': 'Full PUT Updated Title',
+            'description': 'Updated description via PUT',
+        }
+        put_rec_res = self.client.put(rec_url, put_rec_payload, format='json')
+        self.assertEqual(put_rec_res.status_code, status.HTTP_200_OK)
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.title, 'Full PUT Updated Title')
+        self.assertEqual(self.record_doc1_pat1.patient, self.patient_1)
+        self.assertEqual(self.record_doc1_pat1.doctor, self.doctor_1)
+
+        # Full PUT on prescription with unchanged patient and doctor
+        put_rx_payload = {
+            'patient': str(self.patient_1.id),
+            'doctor': str(self.doctor_1.id),
+            'instructions': 'Updated instructions via PUT',
+            'items': [
+                {
+                    'medication_name': 'PutUpdatedMed',
+                    'dosage': '100mg',
+                    'frequency': 'once daily',
+                    'duration': '10 days',
+                    'instructions': 'Take in morning',
+                }
+            ],
+        }
+        put_rx_res = self.client.put(rx_url, put_rx_payload, format='json')
+        self.assertEqual(put_rx_res.status_code, status.HTTP_200_OK)
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.instructions, 'Updated instructions via PUT')
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 1)
+        self.assertEqual(self.rx_doc1_pat1.items.first().medication_name, 'PutUpdatedMed')
+
+    def test_partial_updates_without_patient_and_doctor_succeed(self):
+        """Partial updates omitting patient and doctor succeed without altering ownership."""
+        self.client.force_authenticate(user=self.doctor_1)
+        rec_url = self.record_detail_url(self.record_doc1_pat1.id)
+        rx_url = self.prescription_detail_url(self.rx_doc1_pat1.id)
+
+        # PATCH record title only
+        patch_rec_res = self.client.patch(rec_url, {'title': 'Only Title Changed'}, format='json')
+        self.assertEqual(patch_rec_res.status_code, status.HTTP_200_OK)
+        self.record_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.record_doc1_pat1.title, 'Only Title Changed')
+        self.assertEqual(self.record_doc1_pat1.patient, self.patient_1)
+        self.assertEqual(self.record_doc1_pat1.doctor, self.doctor_1)
+
+        # PATCH prescription instructions only
+        patch_rx_res = self.client.patch(rx_url, {'instructions': 'Only Instructions Changed'}, format='json')
+        self.assertEqual(patch_rx_res.status_code, status.HTTP_200_OK)
+        self.rx_doc1_pat1.refresh_from_db()
+        self.assertEqual(self.rx_doc1_pat1.instructions, 'Only Instructions Changed')
+        self.assertEqual(self.rx_doc1_pat1.items.count(), 2)
+
+    def test_consultation_matching_and_nullable_behavior(self):
+        """
+        Supplied consultation must match effective patient and doctor.
+        Mismatched consultations are rejected; null consultations are preserved.
+        """
+        # Create consultation fixtures
+        c_doc1_pat1 = Consultation.objects.create(
+            doctor=self.doctor_1,
+            patient=self.patient_1,
+            status='completed',
+        )
+        c_doc2_pat2 = Consultation.objects.create(
+            doctor=self.doctor_2,
+            patient=self.patient_2,
+            status='completed',
+        )
+        c_doc1_pat2 = Consultation.objects.create(
+            doctor=self.doctor_1,
+            patient=self.patient_2,
+            status='completed',
+        )
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. Matching consultation on record creation succeeds
+        rec_res = self.client.post(self.record_list_url, {
+            'patient': str(self.patient_1.id),
+            'consultation': str(c_doc1_pat1.id),
+            'title': 'Consult Matched Record',
+            'description': 'Details',
+        }, format='json')
+        self.assertEqual(rec_res.status_code, status.HTTP_201_CREATED)
+        rec_id = rec_res.data['id']
+        self.assertEqual(str(rec_res.data['consultation']), str(c_doc1_pat1.id))
+
+        # 2. Matching consultation on prescription creation succeeds
+        rx_res = self.client.post(self.prescription_list_url, {
+            'patient': str(self.patient_1.id),
+            'consultation': str(c_doc1_pat1.id),
+            'instructions': 'Consult Matched Prescription',
+        }, format='json')
+        self.assertEqual(rx_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(rx_res.data['consultation']), str(c_doc1_pat1.id))
+
+        # 3. Mismatched patient (same doctor, different patient) on record creation rejected
+        rec_bad_pat = self.client.post(self.record_list_url, {
+            'patient': str(self.patient_1.id),
+            'consultation': str(c_doc1_pat2.id),  # consultation patient is patient_2
+            'title': 'Bad Patient Consult Record',
+            'description': 'Details',
+        }, format='json')
+        self.assertEqual(rec_bad_pat.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('consultation', self.get_error_details(rec_bad_pat))
+        self.assertFalse(MedicalRecord.objects.filter(title='Bad Patient Consult Record').exists())
+
+        # 4. Mismatched doctor and patient on prescription creation rejected
+        rx_bad = self.client.post(self.prescription_list_url, {
+            'patient': str(self.patient_1.id),
+            'consultation': str(c_doc2_pat2.id),  # doctor_2 and patient_2
+            'instructions': 'Bad Consult Rx',
+        }, format='json')
+        self.assertEqual(rx_bad.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('consultation', self.get_error_details(rx_bad))
+        self.assertFalse(Prescription.objects.filter(instructions='Bad Consult Rx').exists())
+
+        # 5. Admin creating record without doctor supplying consultation is rejected
+        self.client.force_authenticate(user=self.admin)
+        rec_admin_no_doc = self.client.post(self.record_list_url, {
+            'patient': str(self.patient_1.id),
+            'consultation': str(c_doc1_pat1.id),
+            'title': 'Admin Consult Record No Doctor',
+            'description': 'Details',
+        }, format='json')
+        self.assertEqual(rec_admin_no_doc.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('consultation', self.get_error_details(rec_admin_no_doc))
+
+        # 6. Doctor 1 updates record to clear consultation (consultation: null)
+        self.client.force_authenticate(user=self.doctor_1)
+        clear_url = self.record_detail_url(rec_id)
+        clear_res = self.client.patch(clear_url, {'consultation': None}, format='json')
+        self.assertEqual(clear_res.status_code, status.HTTP_200_OK)
+        rec_cleared = MedicalRecord.objects.get(id=rec_id)
+        self.assertIsNone(rec_cleared.consultation)
+
+        # 7. Doctor 1 updates record to attach mismatched consultation is rejected
+        bad_update_res = self.client.patch(clear_url, {'consultation': str(c_doc2_pat2.id)}, format='json')
+        self.assertEqual(bad_update_res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('consultation', self.get_error_details(bad_update_res))
+        rec_cleared.refresh_from_db()
+        self.assertIsNone(rec_cleared.consultation)
