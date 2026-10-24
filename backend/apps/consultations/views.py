@@ -60,6 +60,10 @@ class ConsultationViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def start(self, request, pk=None):
         consultation = self.get_object()
+        if request.user.role not in ['doctor', 'admin']:
+            return Response({'error': 'Only doctors or admins can start consultations.'}, status=status.HTTP_403_FORBIDDEN)
+        if request.user.role == 'doctor' and consultation.doctor_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor can start this consultation.'}, status=status.HTTP_403_FORBIDDEN)
         consultation.status = 'in_progress'
         consultation.started_at = consultation.started_at or timezone.now()
         consultation.save(update_fields=['status', 'started_at', 'updated_at'])
@@ -70,6 +74,8 @@ class ConsultationViewSet(viewsets.ModelViewSet):
         consultation = self.get_object()
         if request.user.role not in ['doctor', 'admin']:
             return Response({'error': 'Only doctors or admins can end consultations.'}, status=status.HTTP_403_FORBIDDEN)
+        if request.user.role == 'doctor' and consultation.doctor_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor can end this consultation.'}, status=status.HTTP_403_FORBIDDEN)
         consultation.status = 'completed'
         consultation.ended_at = timezone.now()
         for field in ['diagnosis', 'clinical_notes', 'follow_up_notes']:

@@ -48,6 +48,19 @@ class ConsultationSerializer(serializers.ModelSerializer):
 
         # Apply creation security rules only when creating a new consultation
         if self.instance is None:
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+
+            # Reject patient-supplied clinical fields during creation
+            if user and getattr(user, 'role', None) == 'patient':
+                clinical_fields = ['diagnosis', 'clinical_notes', 'follow_up_required', 'follow_up_notes']
+                injected = [f for f in clinical_fields if f in data]
+                if injected:
+                    raise serializers.ValidationError({
+                        f: 'Patients cannot supply clinical fields during consultation creation.'
+                        for f in injected
+                    })
+
             raw_appointment = data.get('appointment')
             if raw_appointment is None or str(raw_appointment).strip() == '':
                 raise serializers.ValidationError({
@@ -75,9 +88,6 @@ class ConsultationSerializer(serializers.ModelSerializer):
                 })
 
             # 3. Caller authorization check
-            request = self.context.get('request')
-            user = getattr(request, 'user', None)
-
             if not user or not user.is_authenticated:
                 raise serializers.ValidationError({
                     'detail': 'Authentication credentials were not provided.'
@@ -128,6 +138,45 @@ class ConsultationSerializer(serializers.ModelSerializer):
                         'doctor': 'Supplied doctor conflicts with the appointment.'
                     })
             data['doctor'] = appointment.doctor_id
+
+        if self.instance is not None:
+            # 1. Appointment immutability
+            if 'appointment' in data:
+                raw_appt = data['appointment']
+                raw_appt_id = getattr(raw_appt, 'id', raw_appt) if raw_appt is not None else None
+                inst_appt_id = getattr(self.instance.appointment, 'id', self.instance.appointment_id)
+                if str(raw_appt_id or '') != str(inst_appt_id or ''):
+                    raise serializers.ValidationError({
+                        'appointment': 'Appointment cannot be changed after creation.'
+                    })
+
+            # 2. Patient immutability
+            if 'patient' in data:
+                raw_pat = data['patient']
+                raw_pat_id = getattr(raw_pat, 'id', raw_pat) if raw_pat is not None else None
+                inst_pat_id = getattr(self.instance.patient, 'id', self.instance.patient_id)
+                if str(raw_pat_id or '') != str(inst_pat_id or ''):
+                    raise serializers.ValidationError({
+                        'patient': 'Patient cannot be changed after creation.'
+                    })
+
+            # 3. Doctor immutability
+            if 'doctor' in data:
+                raw_doc = data['doctor']
+                raw_doc_id = getattr(raw_doc, 'id', raw_doc) if raw_doc is not None else None
+                inst_doc_id = getattr(self.instance.doctor, 'id', self.instance.doctor_id)
+                if str(raw_doc_id or '') != str(inst_doc_id or ''):
+                    raise serializers.ValidationError({
+                        'doctor': 'Doctor cannot be changed after creation.'
+                    })
+
+            # 4. Status immutability via generic PUT/PATCH
+            if 'status' in data:
+                raw_status = str(data['status']).strip() if data['status'] is not None else ''
+                if raw_status != str(self.instance.status):
+                    raise serializers.ValidationError({
+                        'status': 'Status cannot be changed directly via PUT/PATCH. Use lifecycle actions instead.'
+                    })
 
         return super().to_internal_value(data)
 
