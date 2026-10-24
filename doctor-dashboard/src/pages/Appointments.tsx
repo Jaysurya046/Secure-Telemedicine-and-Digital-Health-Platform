@@ -11,8 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Filter,
-  User,
-  Video
+  User
 } from 'lucide-react';
 import { apiFetch } from '../services/api';
 
@@ -42,12 +41,15 @@ type Appointment = {
   created_at: string;
 };
 
-export function Appointments({ onNavigateConsultation }: { onNavigateConsultation?: (roomId: string) => void }) {
+export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () => Promise<void> | void }) {
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
+  const [loadingError, setLoadingError] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [page, setPage] = useState<number>(1);
   const [totalCount, setTotalCount] = useState<number>(0);
+  const [hasNextPage, setHasNextPage] = useState<boolean>(false);
+  const [hasPrevPage, setHasPrevPage] = useState<boolean>(false);
 
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
   const [feedbackSuccess, setFeedbackSuccess] = useState<string>('');
@@ -61,9 +63,9 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
     loadAppointments(1, statusFilter);
   }, [statusFilter]);
 
-  async function loadAppointments(pageNumber: number = 1, currentFilter: StatusFilter = statusFilter) {
+  async function loadAppointments(pageNumber: number = page, currentFilter: StatusFilter = statusFilter) {
     setLoading(true);
-    setFeedbackError('');
+    setLoadingError('');
     try {
       let url = `/api/appointments/?page=${pageNumber}`;
       if (currentFilter !== 'all') {
@@ -73,13 +75,27 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
       if (Array.isArray(data)) {
         setAppointments(data);
         setTotalCount(data.length);
+        setHasNextPage(false);
+        setHasPrevPage(false);
+        setPage(1);
       } else {
-        setAppointments(data.results || []);
-        setTotalCount(data.count || (data.results || []).length);
+        const results = data.results || [];
+        const count = data.count !== undefined ? data.count : results.length;
+
+        // Handle the last item disappearing from a filtered/subsequent page
+        if (results.length === 0 && pageNumber > 1) {
+          return loadAppointments(pageNumber - 1, currentFilter);
+        }
+
+        setAppointments(results);
+        setTotalCount(count);
+        setHasNextPage(Boolean(data.next));
+        setHasPrevPage(Boolean(data.previous));
+        setPage(pageNumber);
       }
-      setPage(pageNumber);
     } catch (err: any) {
-      setFeedbackError(err.message || 'Failed to load appointments.');
+      setLoadingError(err.message || 'Failed to load appointments.');
+      setAppointments([]);
     } finally {
       setLoading(false);
     }
@@ -95,7 +111,8 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
         body: JSON.stringify({})
       });
       setFeedbackSuccess('Appointment confirmed successfully.');
-      await loadAppointments(page);
+      await loadAppointments(page, statusFilter);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to confirm appointment.');
     } finally {
@@ -113,7 +130,8 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
         body: JSON.stringify({})
       });
       setFeedbackSuccess('Appointment marked as completed.');
-      await loadAppointments(page);
+      await loadAppointments(page, statusFilter);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to complete appointment.');
     } finally {
@@ -136,7 +154,8 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
       setFeedbackSuccess('Appointment cancelled successfully.');
       setCancellingAppointment(null);
       setCancellationReason('');
-      await loadAppointments(page);
+      await loadAppointments(page, statusFilter);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to cancel appointment.');
     } finally {
@@ -145,32 +164,34 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
   }
 
   function renderStatusBadge(status: string) {
-    const badgeStyle: Record<string, { bg: string; color: string; label: string }> = {
+    const map: Record<string, { bg: string; color: string; label: string }> = {
       pending: { bg: '#fef3c7', color: '#92400e', label: 'Pending' },
       confirmed: { bg: '#d1fae5', color: '#065f46', label: 'Confirmed' },
       completed: { bg: '#e0f2fe', color: '#0369a1', label: 'Completed' },
       cancelled: { bg: '#ffe4e6', color: '#9f1239', label: 'Cancelled' },
       no_show: { bg: '#f1f5f9', color: '#475569', label: 'No Show' }
     };
-    const b = badgeStyle[status] || badgeStyle.pending;
+    const s = map[status] || map.pending;
     return (
       <span
         style={{
-          background: b.bg,
-          color: b.color,
+          background: s.bg,
+          color: s.color,
+          fontSize: '0.75rem',
+          fontWeight: 700,
           padding: '0.2rem 0.6rem',
           borderRadius: '999px',
-          fontSize: '0.75rem',
-          fontWeight: 700
+          textTransform: 'capitalize'
         }}
       >
-        {b.label}
+        {s.label}
       </span>
     );
   }
 
   return (
     <section className="stack">
+      {/* Top Controls & Banner */}
       <div className="panel">
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.75rem' }}>
           <div>
@@ -181,42 +202,38 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
             <span className="muted">{totalCount} total appointment{totalCount === 1 ? '' : 's'}</span>
           </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-            <button
-              className="icon-button"
-              onClick={() => loadAppointments(page)}
-              disabled={loading}
-              title="Refresh queue"
-            >
-              <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
-              Refresh
-            </button>
-          </div>
+          <button className="icon-button" onClick={() => loadAppointments(page, statusFilter)} disabled={loading} title="Refresh appointments">
+            <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
+            Refresh
+          </button>
         </div>
 
-        {/* Filter Bar */}
-        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginTop: '1rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem' }}>
-          <span style={{ display: 'flex', alignItems: 'center', gap: '0.3rem', fontSize: '0.85rem', fontWeight: 700, color: '#64748b', marginRight: '0.5rem' }}>
+        {/* Filter pills */}
+        <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem', flexWrap: 'wrap' }}>
+          <span style={{ display: 'flex', alignItems: 'center', gap: '0.25rem', fontSize: '0.8rem', fontWeight: 700, color: '#64748b', marginRight: '0.5rem' }}>
             <Filter size={14} /> Filter:
           </span>
-          {(['all', 'pending', 'confirmed', 'completed', 'cancelled'] as StatusFilter[]).map((st) => (
+          {(['all', 'pending', 'confirmed', 'completed', 'cancelled'] as const).map((mode) => (
             <button
-              key={st}
-              onClick={() => setStatusFilter(st)}
+              key={mode}
+              onClick={() => {
+                setStatusFilter(mode);
+                setPage(1);
+              }}
               style={{
                 padding: '0.35rem 0.75rem',
                 borderRadius: '6px',
                 border: '1px solid',
-                borderColor: statusFilter === st ? '#2f9e8f' : '#cbd5e1',
-                background: statusFilter === st ? '#e6f7f5' : '#ffffff',
-                color: statusFilter === st ? '#0f766e' : '#334155',
+                borderColor: statusFilter === mode ? '#2f9e8f' : '#cbd5e1',
+                background: statusFilter === mode ? '#e6f7f5' : '#ffffff',
+                color: statusFilter === mode ? '#0f766e' : '#334155',
                 fontSize: '0.8rem',
                 fontWeight: 700,
                 cursor: 'pointer',
                 textTransform: 'capitalize'
               }}
             >
-              {st}
+              {mode}
             </button>
           ))}
         </div>
@@ -241,6 +258,14 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
         <div className="panel" style={{ textAlign: 'center', padding: '2rem' }}>
           <RefreshCw size={24} color="#2f9e8f" className="animate-spin" style={{ margin: '0 auto 0.5rem' }} />
           <p className="muted">Loading appointment queue...</p>
+        </div>
+      ) : loadingError ? (
+        <div className="panel" style={{ textAlign: 'center', padding: '2rem', border: '1px solid #fecdd3', background: '#fff1f2' }}>
+          <AlertCircle size={32} color="#be123c" style={{ margin: '0 auto 0.5rem' }} />
+          <p style={{ fontWeight: 700, color: '#be123c', margin: '0.5rem 0' }}>{loadingError}</p>
+          <button className="primary" onClick={() => loadAppointments(page, statusFilter)} style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>
+            <RefreshCw size={14} /> Retry Loading
+          </button>
         </div>
       ) : appointments.length === 0 ? (
         <div className="panel" style={{ textAlign: 'center', padding: '3rem' }}>
@@ -284,16 +309,6 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
 
               {/* Action Buttons */}
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '0.5rem', borderTop: '1px solid #f1f5f9', paddingTop: '0.6rem', marginTop: '0.3rem' }}>
-                {appt.status === 'confirmed' && onNavigateConsultation && (
-                  <button
-                    className="icon-button"
-                    style={{ background: '#ecfdf5', color: '#065f46', borderColor: '#a7f3d0', fontSize: '0.8rem' }}
-                    onClick={() => onNavigateConsultation(appt.id)}
-                  >
-                    <Video size={14} /> Open Consult
-                  </button>
-                )}
-
                 {appt.status === 'pending' && (
                   <button
                     className="primary"
@@ -320,8 +335,8 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
 
                 {(appt.status === 'pending' || appt.status === 'confirmed') && (
                   <button
-                    className="danger"
-                    style={{ fontSize: '0.8rem', minHeight: '2.2rem', padding: '0.4rem 0.8rem' }}
+                    className="icon-button"
+                    style={{ color: '#be123c', borderColor: '#fecdd3', fontSize: '0.8rem', minHeight: '2.2rem', padding: '0.4rem 0.8rem' }}
                     disabled={actionInProgress === appt.id}
                     onClick={() => {
                       setCancellingAppointment(appt);
@@ -336,21 +351,25 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
             </article>
           ))}
 
-          {/* Pagination */}
-          {totalCount > 10 && (
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.5rem 0' }}>
+          {/* Working Pagination controls using API next/previous metadata */}
+          {(hasPrevPage || hasNextPage || totalCount > 10) && (
+            <div className="panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.8rem 1rem' }}>
               <button
                 className="icon-button"
-                disabled={page <= 1}
-                onClick={() => loadAppointments(page - 1)}
+                disabled={!hasPrevPage && page <= 1}
+                onClick={() => loadAppointments(page - 1, statusFilter)}
+                style={{ fontSize: '0.85rem' }}
               >
-                <ChevronLeft size={16} /> Prev
+                <ChevronLeft size={16} /> Previous
               </button>
-              <span className="muted" style={{ fontWeight: 700 }}>Page {page}</span>
+              <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#475569' }}>
+                Page {page}
+              </span>
               <button
                 className="icon-button"
-                disabled={page * 10 >= totalCount}
-                onClick={() => loadAppointments(page + 1)}
+                disabled={!hasNextPage}
+                onClick={() => loadAppointments(page + 1, statusFilter)}
+                style={{ fontSize: '0.85rem' }}
               >
                 Next <ChevronRight size={16} />
               </button>
@@ -359,7 +378,7 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
         </div>
       )}
 
-      {/* Cancel Prompt Modal */}
+      {/* Cancel Modal */}
       {cancellingAppointment && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)', backdropFilter: 'blur(3px)', display: 'grid', placeItems: 'center', zIndex: 100, padding: '1rem' }}>
           <div className="panel" style={{ width: '100%', maxWidth: '28rem', display: 'grid', gap: '0.8rem' }}>
@@ -367,23 +386,28 @@ export function Appointments({ onNavigateConsultation }: { onNavigateConsultatio
               <strong style={{ fontSize: '1.1rem' }}>Cancel Appointment</strong>
               <button className="icon-button icon-only" onClick={() => setCancellingAppointment(null)}><X size={16} /></button>
             </div>
-            <p className="muted" style={{ margin: 0 }}>
-              Cancel appointment with <strong>{cancellingAppointment.patient_detail?.profile?.full_name || cancellingAppointment.patient_detail?.email}</strong>?
-            </p>
+
             <form onSubmit={handleCancelSubmit} style={{ display: 'grid', gap: '0.8rem' }}>
+              <p style={{ margin: 0, fontSize: '0.9rem', color: '#475569' }}>
+                Are you sure you want to cancel the appointment for <strong>{cancellingAppointment.patient_detail?.profile?.full_name || cancellingAppointment.patient_detail?.email || 'this patient'}</strong>?
+              </p>
+
               <div>
-                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', marginBottom: '0.25rem' }}>Cancellation Reason (optional)</label>
+                <label style={{ display: 'block', fontSize: '0.75rem', fontWeight: 800, textTransform: 'uppercase', marginBottom: '0.25rem' }}>
+                  Cancellation Reason (Optional)
+                </label>
                 <input
                   type="text"
-                  placeholder="e.g. Doctor emergency, patient requested cancel"
+                  placeholder="e.g. Doctor emergency, patient request"
                   value={cancellationReason}
                   onChange={(e) => setCancellationReason(e.target.value)}
                   style={{ width: '100%' }}
                 />
               </div>
-              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem' }}>
-                <button type="button" className="icon-button" onClick={() => setCancellingAppointment(null)}>Keep Appointment</button>
-                <button type="submit" className="danger" disabled={actionInProgress === cancellingAppointment.id}>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <button type="button" className="icon-button" onClick={() => setCancellingAppointment(null)}>Go Back</button>
+                <button type="submit" className="primary" style={{ background: '#be123c' }} disabled={actionInProgress === cancellingAppointment.id}>
                   {actionInProgress === cancellingAppointment.id ? 'Cancelling...' : 'Confirm Cancellation'}
                 </button>
               </div>

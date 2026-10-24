@@ -8,7 +8,7 @@ import { Patients } from './pages/Patients';
 import { Consultation } from './pages/Consultation';
 import { PatientHistory } from './components/PatientHistory';
 import { PrescriptionForm } from './components/PrescriptionForm';
-import { apiFetch, login } from './services/api';
+import { apiFetch, login, clearTokens, getToken } from './services/api';
 
 type Tab = 'dashboard' | 'appointments' | 'availability' | 'patients' | 'consultation';
 
@@ -16,6 +16,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => Boolean(getToken()));
   const [appointments, setAppointments] = useState<any[]>([]);
   const [patients, setPatients] = useState<any[]>([]);
   const [records, setRecords] = useState<any[]>([]);
@@ -41,10 +42,21 @@ export default function App() {
     setError('');
     try {
       await login(email, password);
+      setIsAuthenticated(true);
       await loadData();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
     }
+  }
+
+  async function handleLogout() {
+    clearTokens();
+    setIsAuthenticated(false);
+    setAppointments([]);
+    setPatients([]);
+    setRecords([]);
+    setSelectedPatient(null);
+    await loadData().catch(() => {});
   }
 
   async function selectPatient(patient: any) {
@@ -52,11 +64,6 @@ export default function App() {
     setTab('patients');
     const data = await apiFetch<any>(`/api/medical-records/?patient=${patient.id}`).catch(() => ({ results: [] }));
     setRecords(data.results || data);
-  }
-
-  function navigateToConsultation(roomId: string) {
-    setConsultationRoomId(roomId);
-    setTab('consultation');
   }
 
   return (
@@ -81,12 +88,23 @@ export default function App() {
       </aside>
 
       <section className="workspace">
-        <form className="login-strip" onSubmit={submitLogin}>
-          <input placeholder="Doctor email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} />
-          <input placeholder="Password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
-          <button className="primary"><LogIn size={16} />Sign in</button>
-          {error ? <span className="error">{error}</span> : null}
-        </form>
+        {isAuthenticated ? (
+          <div className="login-strip" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#334155' }}>
+              Doctor Session Active {email ? `(${email})` : ''}
+            </span>
+            <button type="button" className="icon-button" onClick={handleLogout} style={{ fontSize: '0.8rem' }}>
+              <LogIn size={14} /> Sign out
+            </button>
+          </div>
+        ) : (
+          <form className="login-strip" onSubmit={submitLogin}>
+            <input placeholder="Doctor email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} />
+            <input placeholder="Password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+            <button className="primary"><LogIn size={16} />Sign in</button>
+            {error ? <span className="error">{error}</span> : null}
+          </form>
+        )}
 
         {tab === 'dashboard' ? (
           <Dashboard
@@ -98,11 +116,11 @@ export default function App() {
         ) : null}
 
         {tab === 'appointments' ? (
-          <Appointments onNavigateConsultation={navigateToConsultation} />
+          <Appointments onRefreshDashboard={loadData} />
         ) : null}
 
         {tab === 'availability' ? (
-          <Availability />
+          <Availability onRefreshDashboard={loadData} />
         ) : null}
 
         {tab === 'patients' ? (

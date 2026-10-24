@@ -17,7 +17,7 @@ from django.contrib.auth import get_user_model
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.test import APITestCase, APIRequestFactory
+from rest_framework.test import APITestCase, APITransactionTestCase, APIRequestFactory
 
 from apps.appointments.models import Appointment, DoctorAvailability
 from apps.appointments.permissions import AppointmentAccessPermission, DoctorAvailabilityAccessPermission
@@ -25,10 +25,11 @@ from apps.appointments.permissions import AppointmentAccessPermission, DoctorAva
 User = get_user_model()
 
 
-class BaseAppointmentTestCase(APITestCase):
-    """Base test setup with patients, doctors, admin, and unsupported role fixtures."""
+class AppointmentTestMixin:
+    """Shared test setup and helper methods for appointment test cases."""
 
     def setUp(self):
+        super().setUp()
         # Patients
         self.patient_1 = User.objects.create_user(
             email='patient1@example.com',
@@ -130,6 +131,16 @@ class BaseAppointmentTestCase(APITestCase):
         if isinstance(response.data, dict) and 'details' in response.data:
             return response.data['details']
         return response.data
+
+
+class BaseAppointmentTestCase(AppointmentTestMixin, APITestCase):
+    """Base test setup with standard transactional rollback between tests."""
+    pass
+
+
+class BaseAppointmentTransactionTestCase(AppointmentTestMixin, APITransactionTestCase):
+    """Committed transaction test setup for multi-threaded concurrency testing."""
+    pass
 
 
 class PatientBookingAndDerivationTests(BaseAppointmentTestCase):
@@ -3325,13 +3336,16 @@ class AppointmentAvailabilityValidationTests(BaseAppointmentTestCase):
             self.assertEqual(Appointment.objects.count(), initial_count)
 
 
-class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTestCase):
+class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransactionTestCase):
     """
     Tests for backend concurrency, locking, and lifecycle coordination:
-    - Prevent concurrent overlapping bookings and rescheduling for the same doctor.
-    - Validate and persist within consistent transaction/locking strategy.
-    - Coordinate rescheduling with confirm/cancel/complete so stale updates cannot undo lifecycle changes.
-    - PostgreSQL concurrency tests using independent connections (or explicit report if unavailable).
+    - Inherits from BaseAppointmentTransactionTestCase (APITransactionTestCase) with committed fixtures.
+    - Prevents concurrent overlapping bookings and rescheduling for the same doctor.
+    - Validates and persists within consistent transaction/locking strategy with select_for_update().
+    - Coordinates rescheduling with confirm/cancel/complete so stale updates cannot undo lifecycle changes.
+    - Uses independent connections, bounded synchronization (Barrier with timeout), thread exception capture, and guaranteed cleanup.
+    - Freezes time consistently across threads.
+    - Accurately reports unsupported database skips when PostgreSQL is unavailable.
     """
 
     FIXED_NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
@@ -3399,52 +3413,228 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTestCas
             self.appointment_1.refresh_from_db()
             self.assertEqual(self.appointment_1.status, 'completed')
 
-    def test_postgresql_concurrency_independent_connections(self):
+    def test_postgresql_concurrent_booking_same_doctor_slot(self):
         """
-        PostgreSQL concurrency test using independent database connections.
-        Tests that concurrent booking requests for the same doctor slot serialize and prevent overlapping bookings.
-        Explicitly reports and skips if PostgreSQL is unavailable.
+        PostgreSQL concurrency test: Two patients attempt concurrent booking for the same doctor slot.
+        Verifies that row-level locking serializes bookings and prevents duplicate bookings.
+        Bounded sync, thread exception capture, guaranteed connection cleanup, and accurate DB engine skip report.
         """
         from django.db import connection
         if connection.vendor != 'postgresql':
             self.skipTest(
-                "PostgreSQL is unavailable in the current test environment (active engine is "
+                f"PostgreSQL is unavailable in the current test environment (active engine is "
                 f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
-                "PostgreSQL concurrency test skipped as instructed."
+                "PostgreSQL multi-threaded concurrency test skipped as instructed."
             )
 
         import threading
+        from rest_framework.test import APIClient
+        from django.db import connection as thread_conn
+
         results = []
-        barrier = threading.Barrier(2)
+        thread_exceptions = []
+        barrier = threading.Barrier(2, timeout=10.0)
+        target_start = self.FIXED_NOW + timedelta(days=3, hours=14)
+        target_end = self.FIXED_NOW + timedelta(days=3, hours=15)
 
         def attempt_booking(patient_user):
-            from rest_framework.test import APIClient
-            from django.db import connection as thread_conn
-            client = APIClient()
-            client.force_authenticate(user=patient_user)
-            barrier.wait()
-            res = client.post(
-                self.list_url,
-                {
-                    'doctor': str(self.doctor_1.id),
-                    'scheduled_start': (self.FIXED_NOW + timedelta(days=3, hours=14)).isoformat(),
-                    'scheduled_end': (self.FIXED_NOW + timedelta(days=3, hours=15)).isoformat(),
-                    'reason': 'Concurrent booking slot',
-                },
-                format='json',
-            )
-            results.append(res.status_code)
-            thread_conn.close()
+            try:
+                client = APIClient()
+                client.force_authenticate(user=patient_user)
+                barrier.wait()
+                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+                    res = client.post(
+                        self.list_url,
+                        {
+                            'doctor': str(self.doctor_1.id),
+                            'scheduled_start': target_start.isoformat(),
+                            'scheduled_end': target_end.isoformat(),
+                            'reason': 'Concurrent booking slot',
+                        },
+                        format='json',
+                    )
+                    results.append(res.status_code)
+            except Exception as exc:
+                thread_exceptions.append(exc)
+            finally:
+                thread_conn.close()
 
         t1 = threading.Thread(target=attempt_booking, args=(self.patient_1,))
         t2 = threading.Thread(target=attempt_booking, args=(self.patient_2,))
         t1.start()
         t2.start()
-        t1.join()
-        t2.join()
+        t1.join(timeout=15.0)
+        t2.join(timeout=15.0)
+
+        if thread_exceptions:
+            self.fail(f"Worker thread exception during concurrent booking: {thread_exceptions}")
 
         self.assertIn(status.HTTP_201_CREATED, results)
         self.assertIn(status.HTTP_400_BAD_REQUEST, results)
+        self.assertEqual(
+            Appointment.objects.filter(
+                doctor=self.doctor_1,
+                scheduled_start=target_start,
+                scheduled_end=target_end,
+            ).count(),
+            1,
+        )
+
+    def test_postgresql_concurrent_rescheduling_same_doctor_slot(self):
+        """
+        PostgreSQL concurrency test: Two distinct pending appointments attempt concurrent rescheduling
+        into the exact same future doctor slot.
+        Verifies doctor-level row lock prevents overlapping reschedules.
+        """
+        from django.db import connection
+        if connection.vendor != 'postgresql':
+            self.skipTest(
+                f"PostgreSQL is unavailable in the current test environment (active engine is "
+                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
+                "PostgreSQL multi-threaded concurrency test skipped as instructed."
+            )
+
+        import threading
+        from rest_framework.test import APIClient
+        from django.db import connection as thread_conn
+
+        # Create second pending appointment with doctor_1
+        appt_extra = Appointment.objects.create(
+            patient=self.patient_2,
+            doctor=self.doctor_1,
+            scheduled_start=self.FIXED_NOW + timedelta(days=2, hours=16),
+            scheduled_end=self.FIXED_NOW + timedelta(days=2, hours=17),
+            status='pending',
+            reason='Second pending appointment',
+        )
+
+        results = []
+        thread_exceptions = []
+        barrier = threading.Barrier(2, timeout=10.0)
+        target_start = self.FIXED_NOW + timedelta(days=4, hours=10)
+        target_end = self.FIXED_NOW + timedelta(days=4, hours=11)
+
+        def attempt_reschedule(appt_id, patient_user):
+            try:
+                client = APIClient()
+                client.force_authenticate(user=patient_user)
+                barrier.wait()
+                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+                    res = client.patch(
+                        self.detail_url(appt_id),
+                        {
+                            'scheduled_start': target_start.isoformat(),
+                            'scheduled_end': target_end.isoformat(),
+                        },
+                        format='json',
+                    )
+                    results.append(res.status_code)
+            except Exception as exc:
+                thread_exceptions.append(exc)
+            finally:
+                thread_conn.close()
+
+        t1 = threading.Thread(target=attempt_reschedule, args=(self.appointment_1.id, self.patient_1))
+        t2 = threading.Thread(target=attempt_reschedule, args=(appt_extra.id, self.patient_2))
+        t1.start()
+        t2.start()
+        t1.join(timeout=15.0)
+        t2.join(timeout=15.0)
+
+        if thread_exceptions:
+            self.fail(f"Worker thread exception during concurrent rescheduling: {thread_exceptions}")
+
+        self.assertIn(status.HTTP_200_OK, results)
+        self.assertIn(status.HTTP_400_BAD_REQUEST, results)
+        self.assertEqual(
+            Appointment.objects.filter(
+                doctor=self.doctor_1,
+                scheduled_start=target_start,
+                scheduled_end=target_end,
+            ).count(),
+            1,
+        )
+
+    def test_postgresql_concurrent_reschedule_vs_lifecycle_confirm(self):
+        """
+        PostgreSQL concurrency test: Rescheduling versus lifecycle confirm action.
+        Thread 1 attempts to reschedule appointment_1 while Thread 2 attempts to confirm it.
+        Verifies that select_for_update() row locking coordinates transitions:
+        - If reschedule commits first, appointment remains pending with new timestamps, and confirm then confirms it.
+        - If confirm commits first, appointment becomes confirmed, and reschedule is rejected with HTTP 400.
+        In neither order can a confirmed appointment be overwritten or corrupted by a stale reschedule.
+        """
+        from django.db import connection
+        if connection.vendor != 'postgresql':
+            self.skipTest(
+                f"PostgreSQL is unavailable in the current test environment (active engine is "
+                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
+                "PostgreSQL multi-threaded concurrency test skipped as instructed."
+            )
+
+        import threading
+        from rest_framework.test import APIClient
+        from django.db import connection as thread_conn
+
+        results = {}
+        thread_exceptions = []
+        barrier = threading.Barrier(2, timeout=10.0)
+        new_start = self.FIXED_NOW + timedelta(days=5, hours=14)
+        new_end = self.FIXED_NOW + timedelta(days=5, hours=15)
+
+        def attempt_reschedule():
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.patient_1)
+                barrier.wait()
+                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+                    res = client.patch(
+                        self.detail_url(self.appointment_1.id),
+                        {
+                            'scheduled_start': new_start.isoformat(),
+                            'scheduled_end': new_end.isoformat(),
+                        },
+                        format='json',
+                    )
+                    results['reschedule'] = res.status_code
+            except Exception as exc:
+                thread_exceptions.append(exc)
+            finally:
+                thread_conn.close()
+
+        def attempt_confirm():
+            try:
+                client = APIClient()
+                client.force_authenticate(user=self.doctor_1)
+                barrier.wait()
+                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+                    res = client.post(
+                        self.confirm_url(self.appointment_1.id),
+                        {},
+                        format='json',
+                    )
+                    results['confirm'] = res.status_code
+            except Exception as exc:
+                thread_exceptions.append(exc)
+            finally:
+                thread_conn.close()
+
+        t1 = threading.Thread(target=attempt_reschedule)
+        t2 = threading.Thread(target=attempt_confirm)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15.0)
+        t2.join(timeout=15.0)
+
+        if thread_exceptions:
+            self.fail(f"Worker thread exception during reschedule vs confirm: {thread_exceptions}")
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'confirmed')
+        # Either reschedule succeeded then confirm succeeded (both 200/OK),
+        # or confirm succeeded (200) and reschedule was rejected (400) because appointment was already confirmed
+        self.assertEqual(results['confirm'], status.HTTP_200_OK)
+        self.assertIn(results['reschedule'], [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST])
 
 
 class AppointmentConnectedEndToEndWorkflowTests(BaseAppointmentTestCase):

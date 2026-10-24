@@ -1,12 +1,23 @@
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_URL =
+  typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_URL
+    ? import.meta.env.VITE_API_URL
+    : 'http://localhost:8000';
 
 export function getToken() {
+  if (typeof localStorage === 'undefined') return '';
   return localStorage.getItem('doctorAccessToken') || '';
 }
 
 export function setTokens(tokens: { access: string; refresh: string }) {
+  if (typeof localStorage === 'undefined') return;
   localStorage.setItem('doctorAccessToken', tokens.access);
   localStorage.setItem('doctorRefreshToken', tokens.refresh);
+}
+
+export function clearTokens() {
+  if (typeof localStorage === 'undefined') return;
+  localStorage.removeItem('doctorAccessToken');
+  localStorage.removeItem('doctorRefreshToken');
 }
 
 export function formatErrorMessage(body: any): string {

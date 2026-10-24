@@ -10,8 +10,8 @@ import {
   RefreshCw,
   Power,
   X,
-  Info,
-  Calendar
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { apiFetch } from '../services/api';
 
@@ -36,13 +36,18 @@ type AvailabilityWindow = {
   updated_at: string;
 };
 
-export function Availability() {
+export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () => Promise<void> | void }) {
   const [windows, setWindows] = useState<AvailabilityWindow[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [filterActive, setFilterActive] = useState<'all' | 'active' | 'inactive'>('all');
+  const [page, setPage] = useState<number>(1);
+  const [totalCount, setTotalCount] = useState<number>(0);
+  const [hasNextPage, setHasNextPage] = useState<boolean>(false);
+  const [hasPrevPage, setHasPrevPage] = useState<boolean>(false);
 
   const [feedbackSuccess, setFeedbackSuccess] = useState<string>('');
   const [feedbackError, setFeedbackError] = useState<string>('');
+  const [loadingError, setLoadingError] = useState<string>('');
 
   // Create Form State
   const [showCreateForm, setShowCreateForm] = useState<boolean>(false);
@@ -70,19 +75,39 @@ export function Availability() {
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
 
   useEffect(() => {
-    loadAvailability();
+    loadAvailability(1);
   }, []);
 
-  async function loadAvailability() {
+  async function loadAvailability(pageNumber: number = page) {
     setLoading(true);
-    setFeedbackError('');
+    setLoadingError('');
     try {
-      // Backend DoctorAvailabilityViewSet returns all doctor's windows (active + inactive) for doctor role
-      const data = await apiFetch<any>('/api/doctor-availability/');
-      const list = Array.isArray(data) ? data : data.results || [];
-      setWindows(list);
+      // Backend DoctorAvailabilityViewSet is registered at /api/appointments/availability/
+      const data = await apiFetch<any>(`/api/appointments/availability/?page=${pageNumber}`);
+      if (Array.isArray(data)) {
+        setWindows(data);
+        setTotalCount(data.length);
+        setHasNextPage(false);
+        setHasPrevPage(false);
+        setPage(1);
+      } else {
+        const results = data.results || [];
+        const count = data.count !== undefined ? data.count : results.length;
+
+        // Handle the last item disappearing from a filtered/subsequent page
+        if (results.length === 0 && pageNumber > 1) {
+          return loadAvailability(pageNumber - 1);
+        }
+
+        setWindows(results);
+        setTotalCount(count);
+        setHasNextPage(Boolean(data.next));
+        setHasPrevPage(Boolean(data.previous));
+        setPage(pageNumber);
+      }
     } catch (err: any) {
-      setFeedbackError(err.message || 'Failed to load availability windows.');
+      setLoadingError(err.message || 'Failed to load availability windows.');
+      setWindows([]);
     } finally {
       setLoading(false);
     }
@@ -103,7 +128,7 @@ export function Availability() {
       const startTimeFormatted = createForm.start_time.length === 5 ? `${createForm.start_time}:00` : createForm.start_time;
       const endTimeFormatted = createForm.end_time.length === 5 ? `${createForm.end_time}:00` : createForm.end_time;
 
-      await apiFetch('/api/doctor-availability/', {
+      await apiFetch('/api/appointments/availability/', {
         method: 'POST',
         body: JSON.stringify({
           weekday: Number(createForm.weekday),
@@ -116,7 +141,8 @@ export function Availability() {
       setFeedbackSuccess('Availability window created successfully.');
       setShowCreateForm(false);
       setCreateForm({ weekday: 0, start_time: '09:00', end_time: '17:00', is_active: true });
-      await loadAvailability();
+      await loadAvailability(page);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setCreateError(err.message || 'Failed to create availability window.');
     } finally {
@@ -139,7 +165,7 @@ export function Availability() {
       const startTimeFormatted = editForm.start_time.length === 5 ? `${editForm.start_time}:00` : editForm.start_time;
       const endTimeFormatted = editForm.end_time.length === 5 ? `${editForm.end_time}:00` : editForm.end_time;
 
-      await apiFetch(`/api/doctor-availability/${editingWindow.id}/`, {
+      await apiFetch(`/api/appointments/availability/${editingWindow.id}/`, {
         method: 'PATCH',
         body: JSON.stringify({
           weekday: Number(editForm.weekday),
@@ -151,7 +177,8 @@ export function Availability() {
 
       setFeedbackSuccess('Availability window updated successfully.');
       setEditingWindow(null);
-      await loadAvailability();
+      await loadAvailability(page);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setEditError(err.message || 'Failed to update availability window.');
     } finally {
@@ -164,12 +191,13 @@ export function Availability() {
     setFeedbackError('');
     setFeedbackSuccess('');
     try {
-      await apiFetch(`/api/doctor-availability/${windowItem.id}/`, {
+      await apiFetch(`/api/appointments/availability/${windowItem.id}/`, {
         method: 'PATCH',
         body: JSON.stringify({ is_active: !windowItem.is_active })
       });
       setFeedbackSuccess(`Window set to ${!windowItem.is_active ? 'Active' : 'Inactive'}.`);
-      await loadAvailability();
+      await loadAvailability(page);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to update window status.');
     } finally {
@@ -183,11 +211,12 @@ export function Availability() {
     setFeedbackError('');
     setFeedbackSuccess('');
     try {
-      await apiFetch(`/api/doctor-availability/${windowId}/`, {
+      await apiFetch(`/api/appointments/availability/${windowId}/`, {
         method: 'DELETE'
       });
       setFeedbackSuccess('Availability window deleted.');
-      await loadAvailability();
+      await loadAvailability(page);
+      if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to delete availability window.');
     } finally {
@@ -212,7 +241,7 @@ export function Availability() {
               Doctor Availability Management
             </h2>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.2rem' }}>
-              <span className="muted">{windows.length} total windows ({windows.filter(w => w.is_active).length} active, {windows.filter(w => !w.is_active).length} inactive)</span>
+              <span className="muted">{totalCount} total windows ({windows.filter(w => w.is_active).length} active on page)</span>
               <span style={{ fontSize: '0.75rem', fontWeight: 700, background: '#f1f5f9', color: '#475569', padding: '0.15rem 0.5rem', borderRadius: '4px' }}>
                 Timezone: UTC
               </span>
@@ -224,7 +253,7 @@ export function Availability() {
               <Plus size={16} />
               {showCreateForm ? 'Cancel New Window' : 'Add Availability Window'}
             </button>
-            <button className="icon-button" onClick={loadAvailability} disabled={loading} title="Refresh windows">
+            <button className="icon-button" onClick={() => loadAvailability(page)} disabled={loading} title="Refresh windows">
               <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
             </button>
           </div>
@@ -249,7 +278,7 @@ export function Availability() {
                 textTransform: 'capitalize'
               }}
             >
-              {mode} ({mode === 'all' ? windows.length : mode === 'active' ? windows.filter(w => w.is_active).length : windows.filter(w => !w.is_active).length})
+              {mode}
             </button>
           ))}
         </div>
@@ -343,6 +372,14 @@ export function Availability() {
           <RefreshCw size={24} color="#2f9e8f" className="animate-spin" style={{ margin: '0 auto 0.5rem' }} />
           <p className="muted">Loading availability windows...</p>
         </div>
+      ) : loadingError ? (
+        <div className="panel" style={{ textAlign: 'center', padding: '2rem', border: '1px solid #fecdd3', background: '#fff1f2' }}>
+          <AlertCircle size={32} color="#be123c" style={{ margin: '0 auto 0.5rem' }} />
+          <p style={{ fontWeight: 700, color: '#be123c', margin: '0.5rem 0' }}>{loadingError}</p>
+          <button className="primary" onClick={() => loadAvailability(page)} style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>
+            <RefreshCw size={14} /> Retry Loading
+          </button>
+        </div>
       ) : displayedWindows.length === 0 ? (
         <div className="panel" style={{ textAlign: 'center', padding: '3rem' }}>
           <Clock size={36} color="#94a3b8" style={{ margin: '0 auto 0.5rem' }} />
@@ -429,6 +466,31 @@ export function Availability() {
               </div>
             </article>
           ))}
+
+          {/* Working Pagination controls using API next/previous metadata */}
+          {(hasPrevPage || hasNextPage || totalCount > 10) && (
+            <div className="panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.8rem 1rem' }}>
+              <button
+                className="icon-button"
+                disabled={!hasPrevPage && page <= 1}
+                onClick={() => loadAvailability(page - 1)}
+                style={{ fontSize: '0.85rem' }}
+              >
+                <ChevronLeft size={16} /> Previous
+              </button>
+              <span style={{ fontSize: '0.85rem', fontWeight: 700, color: '#475569' }}>
+                Page {page}
+              </span>
+              <button
+                className="icon-button"
+                disabled={!hasNextPage}
+                onClick={() => loadAvailability(page + 1)}
+                style={{ fontSize: '0.85rem' }}
+              >
+                Next <ChevronRight size={16} />
+              </button>
+            </div>
+          )}
         </div>
       )}
 

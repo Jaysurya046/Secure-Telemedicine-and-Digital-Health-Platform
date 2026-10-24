@@ -8,7 +8,6 @@ import {
   Clock,
   AlertCircle,
   CheckCircle2,
-  XCircle,
   RefreshCw,
   ChevronLeft,
   ChevronRight,
@@ -61,14 +60,21 @@ type Appointment = {
 
 export default function AppointmentsPage() {
   const [doctors, setDoctors] = useState<Doctor[]>([]);
+  const [loadingDoctors, setLoadingDoctors] = useState<boolean>(false);
+  const [doctorsError, setDoctorsError] = useState<string>('');
+
   const [selectedDoctorId, setSelectedDoctorId] = useState<string>('');
   const [doctorAvailabilities, setDoctorAvailabilities] = useState<Availability[]>([]);
   const [loadingAvailabilities, setLoadingAvailabilities] = useState<boolean>(false);
+  const [availabilityError, setAvailabilityError] = useState<string>('');
 
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loadingAppointments, setLoadingAppointments] = useState<boolean>(true);
+  const [appointmentsError, setAppointmentsError] = useState<string>('');
   const [page, setPage] = useState<number>(1);
   const [totalCount, setTotalCount] = useState<number>(0);
+  const [hasNextPage, setHasNextPage] = useState<boolean>(false);
+  const [hasPrevPage, setHasPrevPage] = useState<boolean>(false);
 
   // Booking Form State
   const [bookForm, setBookForm] = useState({
@@ -99,50 +105,111 @@ export default function AppointmentsPage() {
     loadAppointments(1);
   }, []);
 
-  // When selected doctor changes, fetch their active availability
+  // When selected doctor changes, fetch their active availability with race-condition guard
   useEffect(() => {
     if (!selectedDoctorId) {
       setDoctorAvailabilities([]);
+      setAvailabilityError('');
+      setLoadingAvailabilities(false);
       return;
     }
+
+    let isCurrent = true;
     setLoadingAvailabilities(true);
-    apiFetch<any>(`/api/doctor-availability/?doctor=${selectedDoctorId}&is_active=true`)
-      .then((data) => {
-        const list = Array.isArray(data) ? data : data.results || [];
-        setDoctorAvailabilities(list);
-      })
-      .catch(() => {
-        setDoctorAvailabilities([]);
-      })
-      .finally(() => {
-        setLoadingAvailabilities(false);
-      });
+    setAvailabilityError('');
+
+    async function fetchAvailability() {
+      try {
+        let allAvail: Availability[] = [];
+        let nextUrl: string | null = `/api/appointments/availability/?doctor=${selectedDoctorId}&is_active=true`;
+
+        while (nextUrl && isCurrent) {
+          const data: any = await apiFetch<any>(nextUrl);
+          if (!isCurrent) return;
+
+          if (Array.isArray(data)) {
+            allAvail = data;
+            break;
+          }
+          allAvail = [...allAvail, ...(data.results || [])];
+          nextUrl = data.next ? data.next.replace(/^https?:\/\/[^/]+/, '') : null;
+        }
+
+        if (isCurrent) {
+          setDoctorAvailabilities(allAvail);
+        }
+      } catch (err: any) {
+        if (isCurrent) {
+          setDoctorAvailabilities([]);
+          setAvailabilityError(err.message || 'Failed to load doctor availability windows.');
+        }
+      } finally {
+        if (isCurrent) {
+          setLoadingAvailabilities(false);
+        }
+      }
+    }
+
+    fetchAvailability();
+
+    return () => {
+      isCurrent = false;
+    };
   }, [selectedDoctorId]);
 
   async function loadDoctors() {
+    setLoadingDoctors(true);
+    setDoctorsError('');
     try {
-      const data = await apiFetch<any>('/api/auth/doctors/');
-      const list = Array.isArray(data) ? data : data.results || [];
-      setDoctors(list);
-    } catch {
-      // fallback
+      let allDocs: Doctor[] = [];
+      let nextUrl: string | null = '/api/auth/doctors/';
+
+      while (nextUrl) {
+        const data: any = await apiFetch<any>(nextUrl);
+        if (Array.isArray(data)) {
+          allDocs = data;
+          break;
+        }
+        allDocs = [...allDocs, ...(data.results || [])];
+        nextUrl = data.next ? data.next.replace(/^https?:\/\/[^/]+/, '') : null;
+      }
+      setDoctors(allDocs);
+    } catch (err: any) {
+      setDoctorsError(err.message || 'Failed to load doctors list.');
+    } finally {
+      setLoadingDoctors(false);
     }
   }
 
   async function loadAppointments(pageNumber: number = 1) {
     setLoadingAppointments(true);
+    setAppointmentsError('');
     try {
       const data = await apiFetch<any>(`/api/appointments/?page=${pageNumber}`);
       if (Array.isArray(data)) {
         setAppointments(data);
         setTotalCount(data.length);
+        setHasNextPage(false);
+        setHasPrevPage(false);
+        setPage(1);
       } else {
-        setAppointments(data.results || []);
-        setTotalCount(data.count || (data.results || []).length);
+        const results = data.results || [];
+        const count = data.count !== undefined ? data.count : results.length;
+
+        // Handle last item disappearing from a filtered/subsequent page
+        if (results.length === 0 && pageNumber > 1) {
+          return loadAppointments(pageNumber - 1);
+        }
+
+        setAppointments(results);
+        setTotalCount(count);
+        setHasNextPage(Boolean(data.next));
+        setHasPrevPage(Boolean(data.previous));
+        setPage(pageNumber);
       }
-      setPage(pageNumber);
-    } catch {
+    } catch (err: any) {
       setAppointments([]);
+      setAppointmentsError(err.message || 'Failed to load appointments.');
     } finally {
       setLoadingAppointments(false);
     }
@@ -304,6 +371,7 @@ export default function AppointmentsPage() {
                   value={selectedDoctorId}
                   onChange={(e) => setSelectedDoctorId(e.target.value)}
                   required
+                  disabled={loadingDoctors}
                 >
                   <option value="">-- Choose a doctor --</option>
                   {doctors.map((doc) => (
@@ -312,6 +380,14 @@ export default function AppointmentsPage() {
                     </option>
                   ))}
                 </select>
+                {doctorsError && (
+                  <div className="mt-1.5 flex items-center justify-between text-xs text-rose-700">
+                    <span>{doctorsError}</span>
+                    <button type="button" onClick={loadDoctors} className="font-semibold underline hover:text-rose-900">
+                      Retry
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Doctor Availability Section */}
@@ -328,7 +404,30 @@ export default function AppointmentsPage() {
                   </div>
 
                   {loadingAvailabilities ? (
-                    <div className="mt-3 text-xs text-slate-500">Loading availability windows...</div>
+                    <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin text-teal-600" />
+                      Loading availability windows...
+                    </div>
+                  ) : availabilityError ? (
+                    <div className="mt-2.5 rounded bg-rose-50 p-2.5 text-xs text-rose-800 border border-rose-200">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1.5">
+                          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                          {availabilityError}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const curId = selectedDoctorId;
+                            setSelectedDoctorId('');
+                            setTimeout(() => setSelectedDoctorId(curId), 10);
+                          }}
+                          className="font-bold underline ml-2 hover:text-rose-950"
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    </div>
                   ) : doctorAvailabilities.length > 0 ? (
                     <div className="mt-2.5 grid gap-1.5 text-xs">
                       {doctorAvailabilities.map((avail) => (
@@ -428,6 +527,7 @@ export default function AppointmentsPage() {
               onClick={() => loadAppointments(page)}
               className="btn btn-secondary px-2.5 py-1.5 text-xs text-slate-600"
               title="Refresh appointments"
+              disabled={loadingAppointments}
             >
               <RefreshCw className={`h-3.5 w-3.5 ${loadingAppointments ? 'animate-spin' : ''}`} />
               Refresh
@@ -438,6 +538,18 @@ export default function AppointmentsPage() {
             <div className="py-12 text-center text-sm text-slate-500">
               <RefreshCw className="mx-auto h-6 w-6 animate-spin text-teal-600 mb-2" />
               Loading appointments...
+            </div>
+          ) : appointmentsError ? (
+            <div className="my-6 rounded-lg border border-rose-200 bg-rose-50 p-4 text-center">
+              <AlertCircle className="mx-auto h-8 w-8 text-rose-500" />
+              <p className="mt-2 text-sm font-semibold text-rose-800">{appointmentsError}</p>
+              <button
+                onClick={() => loadAppointments(page)}
+                className="btn btn-secondary mt-3 inline-flex text-xs text-rose-800 border-rose-300 hover:bg-rose-100"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Retry
+              </button>
             </div>
           ) : appointments.length === 0 ? (
             <div className="py-12 text-center">
@@ -511,11 +623,11 @@ export default function AppointmentsPage() {
                 </article>
               ))}
 
-              {/* Pagination controls */}
-              {totalCount > 10 && (
+              {/* Pagination controls using API metadata */}
+              {(hasPrevPage || hasNextPage || totalCount > 10) && (
                 <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-4 text-xs font-semibold text-slate-600">
                   <button
-                    disabled={page <= 1}
+                    disabled={!hasPrevPage && page <= 1}
                     onClick={() => loadAppointments(page - 1)}
                     className="flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 disabled:opacity-40"
                   >
@@ -523,7 +635,7 @@ export default function AppointmentsPage() {
                   </button>
                   <span>Page {page}</span>
                   <button
-                    disabled={page * 10 >= totalCount}
+                    disabled={!hasNextPage}
                     onClick={() => loadAppointments(page + 1)}
                     className="flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 disabled:opacity-40"
                   >

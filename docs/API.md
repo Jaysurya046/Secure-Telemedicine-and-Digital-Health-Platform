@@ -691,9 +691,72 @@ For interactive API testing, visit:
 
 ---
 
+## Appointments & Doctor Availability Endpoints
+
+### List / Create Appointments
+- **List**: `GET /api/appointments/` (Supports query parameters: `status`, `page`, `ordering`)
+  - Permissions: Authenticated (`patient` sees own, `doctor` sees own assigned, `admin` sees all).
+  - Paginated Response: `{ "count": N, "next": "...", "previous": "...", "results": [...] }`.
+- **Create**: `POST /api/appointments/`
+  - Permissions: Authenticated (`patient`, `doctor`, `admin`).
+  - Request body:
+    ```json
+    {
+      "doctor": "uuid",
+      "scheduled_start": "2026-11-03T10:00:00Z",
+      "scheduled_end": "2026-11-03T11:00:00Z",
+      "reason": "Consultation",
+      "symptoms": ["headache"]
+    }
+    ```
+  - Derives patient for patient role caller; author spoofing rejected with HTTP 400.
+  - Every new appointment starts with status `pending`.
+
+### Retrieve / Update (Reschedule) Appointment
+- **Retrieve**: `GET /api/appointments/{id}/`
+- **Update / Reschedule**: `PATCH /api/appointments/{id}/`
+  - Only pending appointments can change timestamps.
+  - Rescheduling must fit an active availability window for the doctor and not overlap existing bookings.
+  - Generic PUT/PATCH cannot mutate status directly (use dedicated lifecycle actions).
+
+### Appointment Lifecycle Actions
+- **Confirm**: `POST /api/appointments/{id}/confirm/`
+  - Transition: `pending` -> `confirmed`.
+  - Body: `{}` (empty object required).
+  - Permission: Assigned doctor or admin.
+- **Cancel**: `POST /api/appointments/{id}/cancel/`
+  - Transition: `pending` or `confirmed` -> `cancelled`.
+  - Body: `{ "cancellation_reason": "optional reason string" }`.
+  - Permission: Assigned patient, assigned doctor, or admin.
+- **Complete**: `POST /api/appointments/{id}/complete/`
+  - Transition: `confirmed` -> `completed`.
+  - Body: `{}` (empty object required).
+  - Permission: Assigned doctor or admin.
+
+### Doctor Availability Schedule
+- **List Availability**: `GET /api/appointments/availability/`
+  - Doctors see all their windows (active and inactive). Patients see active windows.
+  - Query parameters: `doctor`, `weekday`, `is_active`, `page`.
+- **Create Availability Window**: `POST /api/appointments/availability/`
+  - Permissions: Doctor (manages own) or Admin (requires doctor user).
+  - Body:
+    ```json
+    {
+      "weekday": 1,
+      "start_time": "09:00:00",
+      "end_time": "17:00:00",
+      "is_active": true
+    }
+    ```
+- **Update Availability Window**: `PATCH /api/appointments/availability/{id}/`
+- **Delete Availability Window**: `DELETE /api/appointments/availability/{id}/` (Returns `204 No Content`).
+
+---
+
 ## Appointment Scheduling & Timezone Handling
 
 - **Timezone Alignment**: Appointment scheduling matches doctor availability windows using Django's configured default timezone (`settings.TIME_ZONE`, currently UTC). Aware datetimes submitted with different UTC offsets are converted to the configured default timezone before comparing weekday and time boundaries.
 - **Active Window Fitting**: On appointment creation and actual datetime changes (rescheduling), the entire appointment must fit inside one active availability window (`is_active=True`) belonging to its doctor. Exact boundaries are permitted (`appointment start >= window start` and `appointment end <= window end`).
 - **Midnight Crossing & Separate Windows**: Appointments crossing midnight in the configured timezone are rejected. Separate availability windows cannot be combined to cover an appointment.
 - **Unchanged Edits & Historical Bookings**: Unrelated updates (such as notes) and unchanged timestamps (including equivalent timestamps expressed with different UTC offsets) do not revalidate doctor availability on existing appointments.
+- **Concurrency & Locking Strategy**: PostgreSQL row-level locks via `select_for_update()` coordinate simultaneous bookings and prevent double-booking or state drift during concurrent requests.
