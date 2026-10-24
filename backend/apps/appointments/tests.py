@@ -3325,5 +3325,333 @@ class AppointmentAvailabilityValidationTests(BaseAppointmentTestCase):
             self.assertEqual(Appointment.objects.count(), initial_count)
 
 
+class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTestCase):
+    """
+    Tests for backend concurrency, locking, and lifecycle coordination:
+    - Prevent concurrent overlapping bookings and rescheduling for the same doctor.
+    - Validate and persist within consistent transaction/locking strategy.
+    - Coordinate rescheduling with confirm/cancel/complete so stale updates cannot undo lifecycle changes.
+    - PostgreSQL concurrency tests using independent connections (or explicit report if unavailable).
+    """
+
+    FIXED_NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+
+    def test_stale_reschedule_rejected_if_appointment_confirmed_in_between(self):
+        """If an appointment is confirmed while reschedule is in-flight, stale reschedule cannot undo confirmation."""
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+        # Simulate confirm action taking place before reschedule commits
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save(update_fields=['status'])
+
+        self.client.force_authenticate(user=self.patient_1)
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.patch(
+                self.detail_url(self.appointment_1.id),
+                {
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=5, hours=10)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=5, hours=11)).isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Cannot reschedule', str(res.data))
+            self.appointment_1.refresh_from_db()
+            self.assertEqual(self.appointment_1.status, 'confirmed')
+
+    def test_stale_reschedule_rejected_if_appointment_cancelled_in_between(self):
+        """If an appointment is cancelled, stale reschedule cannot resurrect it or update timestamps."""
+        self.appointment_1.status = 'cancelled'
+        self.appointment_1.save(update_fields=['status'])
+
+        self.client.force_authenticate(user=self.patient_1)
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.patch(
+                self.detail_url(self.appointment_1.id),
+                {
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=5, hours=10)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=5, hours=11)).isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Cannot reschedule', str(res.data))
+            self.appointment_1.refresh_from_db()
+            self.assertEqual(self.appointment_1.status, 'cancelled')
+
+    def test_stale_reschedule_rejected_if_appointment_completed_in_between(self):
+        """If an appointment is completed, stale reschedule cannot modify timestamps."""
+        self.appointment_1.status = 'completed'
+        self.appointment_1.save(update_fields=['status'])
+
+        self.client.force_authenticate(user=self.patient_1)
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.patch(
+                self.detail_url(self.appointment_1.id),
+                {
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=5, hours=10)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=5, hours=11)).isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('Cannot reschedule', str(res.data))
+            self.appointment_1.refresh_from_db()
+            self.assertEqual(self.appointment_1.status, 'completed')
+
+    def test_postgresql_concurrency_independent_connections(self):
+        """
+        PostgreSQL concurrency test using independent database connections.
+        Tests that concurrent booking requests for the same doctor slot serialize and prevent overlapping bookings.
+        Explicitly reports and skips if PostgreSQL is unavailable.
+        """
+        from django.db import connection
+        if connection.vendor != 'postgresql':
+            self.skipTest(
+                "PostgreSQL is unavailable in the current test environment (active engine is "
+                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
+                "PostgreSQL concurrency test skipped as instructed."
+            )
+
+        import threading
+        results = []
+        barrier = threading.Barrier(2)
+
+        def attempt_booking(patient_user):
+            from rest_framework.test import APIClient
+            from django.db import connection as thread_conn
+            client = APIClient()
+            client.force_authenticate(user=patient_user)
+            barrier.wait()
+            res = client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': (self.FIXED_NOW + timedelta(days=3, hours=14)).isoformat(),
+                    'scheduled_end': (self.FIXED_NOW + timedelta(days=3, hours=15)).isoformat(),
+                    'reason': 'Concurrent booking slot',
+                },
+                format='json',
+            )
+            results.append(res.status_code)
+            thread_conn.close()
+
+        t1 = threading.Thread(target=attempt_booking, args=(self.patient_1,))
+        t2 = threading.Thread(target=attempt_booking, args=(self.patient_2,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertIn(status.HTTP_201_CREATED, results)
+        self.assertIn(status.HTTP_400_BAD_REQUEST, results)
+
+
+class AppointmentConnectedEndToEndWorkflowTests(BaseAppointmentTestCase):
+    """
+    Connected workflow tests exercising complete user paths:
+    - Path 1: Patient booking -> Doctor confirmation -> Doctor completion.
+    - Path 2: Patient booking -> Pending rescheduling -> Doctor confirmation -> Completion.
+    - Path 3: Patient booking -> Patient cancellation.
+    - Path 4: Patient booking -> Doctor confirmation -> Doctor cancellation.
+    - Path 5: Doctor manages availability (create/deactivate/reactivate/delete) impacting bookings.
+    """
+
+    FIXED_NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=dt_timezone.utc)
+
+    def test_workflow_booking_to_confirmation_to_completion(self):
+        """Full happy path: Patient books -> Doctor confirms -> Doctor completes."""
+        # 1. Patient books
+        self.client.force_authenticate(user=self.patient_1)
+        start = self.FIXED_NOW + timedelta(days=2, hours=10)
+        end = self.FIXED_NOW + timedelta(days=2, hours=11)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res_book = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': start.isoformat(),
+                    'scheduled_end': end.isoformat(),
+                    'reason': 'Comprehensive checkup',
+                    'symptoms': ['headache'],
+                },
+                format='json',
+            )
+            self.assertEqual(res_book.status_code, status.HTTP_201_CREATED)
+            appt_id = res_book.data['id']
+            self.assertEqual(res_book.data['status'], 'pending')
+
+            # 2. Doctor lists appointments and sees pending booking
+            self.client.force_authenticate(user=self.doctor_1)
+            res_list = self.client.get(f"{self.list_url}?status=pending")
+            self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+            booking_ids = [a['id'] for a in (res_list.data.get('results') or res_list.data)]
+            self.assertIn(appt_id, booking_ids)
+
+            # 3. Doctor confirms
+            res_confirm = self.client.post(self.confirm_url(appt_id), {}, format='json')
+            self.assertEqual(res_confirm.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_confirm.data['status'], 'confirmed')
+
+            # 4. Doctor completes
+            res_complete = self.client.post(self.complete_url(appt_id), {}, format='json')
+            self.assertEqual(res_complete.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_complete.data['status'], 'completed')
+
+            # Verify persisted row
+            appt = Appointment.objects.get(id=appt_id)
+            self.assertEqual(appt.status, 'completed')
+
+    def test_workflow_booking_rescheduling_and_completion(self):
+        """Workflow: Patient books -> Reschedules while pending -> Doctor confirms -> Doctor completes."""
+        self.client.force_authenticate(user=self.patient_1)
+        start1 = self.FIXED_NOW + timedelta(days=2, hours=10)
+        end1 = self.FIXED_NOW + timedelta(days=2, hours=11)
+        start2 = self.FIXED_NOW + timedelta(days=3, hours=14)
+        end2 = self.FIXED_NOW + timedelta(days=3, hours=15)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # Book
+            res_book = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': start1.isoformat(),
+                    'scheduled_end': end1.isoformat(),
+                    'reason': 'Initial slot',
+                },
+                format='json',
+            )
+            appt_id = res_book.data['id']
+
+            # Patient reschedules to day 3
+            res_reschedule = self.client.patch(
+                self.detail_url(appt_id),
+                {
+                    'scheduled_start': start2.isoformat(),
+                    'scheduled_end': end2.isoformat(),
+                },
+                format='json',
+            )
+            self.assertEqual(res_reschedule.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_reschedule.data['status'], 'pending')
+
+            # Doctor confirms rescheduled slot
+            self.client.force_authenticate(user=self.doctor_1)
+            res_confirm = self.client.post(self.confirm_url(appt_id), {}, format='json')
+            self.assertEqual(res_confirm.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_confirm.data['status'], 'confirmed')
+
+            # Doctor completes
+            res_complete = self.client.post(self.complete_url(appt_id), {}, format='json')
+            self.assertEqual(res_complete.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_complete.data['status'], 'completed')
+
+    def test_workflow_patient_booking_cancellation(self):
+        """Workflow: Patient books -> Patient cancels pending appointment with reason."""
+        self.client.force_authenticate(user=self.patient_1)
+        start = self.FIXED_NOW + timedelta(days=2, hours=10)
+        end = self.FIXED_NOW + timedelta(days=2, hours=11)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res_book = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': start.isoformat(),
+                    'scheduled_end': end.isoformat(),
+                    'reason': 'Consultation',
+                },
+                format='json',
+            )
+            appt_id = res_book.data['id']
+
+            # Cancel with reason
+            res_cancel = self.client.post(
+                self.cancel_url(appt_id),
+                {'cancellation_reason': 'Schedule conflict'},
+                format='json',
+            )
+            self.assertEqual(res_cancel.status_code, status.HTTP_200_OK)
+            self.assertEqual(res_cancel.data['status'], 'cancelled')
+            self.assertEqual(res_cancel.data['cancellation_reason'], 'Schedule conflict')
+
+            # Verify in DB
+            appt = Appointment.objects.get(id=appt_id)
+            self.assertEqual(appt.status, 'cancelled')
+            self.assertEqual(appt.cancellation_reason, 'Schedule conflict')
+
+    def test_workflow_doctor_availability_lifecycle_impacts_booking(self):
+        """Workflow: Doctor manages availability (create, deactivate, reactivate, delete)."""
+        # Clear windows first
+        DoctorAvailability.objects.all().delete()
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. Doctor creates availability on Tuesday 09:00 - 12:00
+        res_create = self.client.post(
+            self.availability_list_url,
+            {
+                'weekday': 1,
+                'start_time': '09:00:00',
+                'end_time': '12:00:00',
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res_create.status_code, status.HTTP_201_CREATED)
+        avail_id = res_create.data['id']
+
+        # 2. Patient books fitting slot -> succeeds
+        self.client.force_authenticate(user=self.patient_1)
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res_book1 = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T10:00:00Z',
+                    'scheduled_end': '2026-11-03T11:00:00Z',
+                    'reason': 'Tuesday visit',
+                },
+                format='json',
+            )
+            self.assertEqual(res_book1.status_code, status.HTTP_201_CREATED)
+
+        # 3. Doctor deactivates the availability window
+        self.client.force_authenticate(user=self.doctor_1)
+        res_deactivate = self.client.patch(
+            self.availability_detail_url(avail_id),
+            {'is_active': False},
+            format='json',
+        )
+        self.assertEqual(res_deactivate.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_deactivate.data['is_active'])
+
+        # 4. Patient attempts booking in the now-inactive window -> rejected with 400
+        self.client.force_authenticate(user=self.patient_2)
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res_book2 = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T11:00:00Z',
+                    'scheduled_end': '2026-11-03T12:00:00Z',
+                    'reason': 'Tuesday visit attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res_book2.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_book2))
+
+        # 5. Doctor deletes the availability window
+        self.client.force_authenticate(user=self.doctor_1)
+        res_delete = self.client.delete(self.availability_detail_url(avail_id))
+        self.assertEqual(res_delete.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(DoctorAvailability.objects.filter(id=avail_id).exists())
+
+
+
+
 
 

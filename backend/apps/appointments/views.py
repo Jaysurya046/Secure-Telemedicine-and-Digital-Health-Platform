@@ -18,6 +18,13 @@ from .serializers import (
 )
 
 
+from collections.abc import Mapping
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError as DjangoValidationError
+
+User = get_user_model()
+
+
 class AppointmentViewSet(viewsets.ModelViewSet):
     serializer_class = AppointmentSerializer
     permission_classes = [IsAuthenticated, AppointmentAccessPermission]
@@ -43,6 +50,42 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         if role == 'patient':
             return queryset.filter(patient=user)
         return Appointment.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        with transaction.atomic():
+            doctor_id = None
+            if getattr(request.user, 'role', None) == 'doctor':
+                doctor_id = request.user.id
+            elif isinstance(request.data, Mapping) or hasattr(request.data, 'get'):
+                doctor_id = request.data.get('doctor')
+
+            if doctor_id:
+                raw_id = getattr(doctor_id, 'id', doctor_id)
+                try:
+                    User.objects.select_for_update().filter(id=raw_id, role='doctor').first()
+                except (ValueError, TypeError, DjangoValidationError):
+                    pass
+
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            self.perform_create(serializer)
+            headers = self.get_success_headers(serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        with transaction.atomic():
+            instance = self.get_object()
+            locked_instance = Appointment.objects.select_for_update().get(id=instance.id)
+
+            doctor = locked_instance.doctor
+            if doctor:
+                User.objects.select_for_update().filter(id=doctor.id).first()
+
+            serializer = self.get_serializer(locked_instance, data=request.data, partial=partial)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+            return Response(serializer.data)
 
     def perform_create(self, serializer):
         if self.request.user.role == 'patient':

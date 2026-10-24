@@ -1,14 +1,16 @@
 import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Activity, LogIn, Stethoscope } from 'lucide-react';
+import { Activity, LogIn, Stethoscope, CalendarCheck, Clock, Users, Video } from 'lucide-react';
 import { Dashboard } from './pages/Dashboard';
+import { Appointments } from './pages/Appointments';
+import { Availability } from './pages/Availability';
 import { Patients } from './pages/Patients';
 import { Consultation } from './pages/Consultation';
 import { PatientHistory } from './components/PatientHistory';
 import { PrescriptionForm } from './components/PrescriptionForm';
 import { apiFetch, login } from './services/api';
 
-type Tab = 'dashboard' | 'patients' | 'consultation';
+type Tab = 'dashboard' | 'appointments' | 'availability' | 'patients' | 'consultation';
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard');
@@ -18,15 +20,16 @@ export default function App() {
   const [patients, setPatients] = useState<any[]>([]);
   const [records, setRecords] = useState<any[]>([]);
   const [selectedPatient, setSelectedPatient] = useState<any>(null);
+  const [consultationRoomId, setConsultationRoomId] = useState<string>('demo');
   const [error, setError] = useState('');
 
   async function loadData() {
     const [appointmentData, patientData] = await Promise.all([
-      apiFetch<any>('/api/appointments/'),
-      apiFetch<any>('/api/auth/patients/')
+      apiFetch<any>('/api/appointments/').catch(() => ({ results: [] })),
+      apiFetch<any>('/api/auth/patients/').catch(() => ({ results: [] }))
     ]);
-    setAppointments(appointmentData.results || appointmentData);
-    setPatients(patientData.results || patientData);
+    setAppointments(appointmentData.results || appointmentData || []);
+    setPatients(patientData.results || patientData || []);
   }
 
   useEffect(() => {
@@ -51,14 +54,32 @@ export default function App() {
     setRecords(data.results || data);
   }
 
+  function navigateToConsultation(roomId: string) {
+    setConsultationRoomId(roomId);
+    setTab('consultation');
+  }
+
   return (
     <main className="shell">
       <aside className="sidebar">
         <div className="brand"><Stethoscope size={24} />CareBridge MD</div>
-        <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}><Activity size={18} />Dashboard</button>
-        <button className={tab === 'patients' ? 'active' : ''} onClick={() => setTab('patients')}>Patients</button>
-        <button className={tab === 'consultation' ? 'active' : ''} onClick={() => setTab('consultation')}>Consultation</button>
+        <button className={tab === 'dashboard' ? 'active' : ''} onClick={() => setTab('dashboard')}>
+          <Activity size={18} />Dashboard
+        </button>
+        <button className={tab === 'appointments' ? 'active' : ''} onClick={() => setTab('appointments')}>
+          <CalendarCheck size={18} />Appointments
+        </button>
+        <button className={tab === 'availability' ? 'active' : ''} onClick={() => setTab('availability')}>
+          <Clock size={18} />Availability
+        </button>
+        <button className={tab === 'patients' ? 'active' : ''} onClick={() => setTab('patients')}>
+          <Users size={18} />Patients
+        </button>
+        <button className={tab === 'consultation' ? 'active' : ''} onClick={() => setTab('consultation')}>
+          <Video size={18} />Consultation
+        </button>
       </aside>
+
       <section className="workspace">
         <form className="login-strip" onSubmit={submitLogin}>
           <input placeholder="Doctor email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} />
@@ -66,7 +87,24 @@ export default function App() {
           <button className="primary"><LogIn size={16} />Sign in</button>
           {error ? <span className="error">{error}</span> : null}
         </form>
-        {tab === 'dashboard' ? <Dashboard appointments={appointments} patients={patients} /> : null}
+
+        {tab === 'dashboard' ? (
+          <Dashboard
+            appointments={appointments}
+            patients={patients}
+            onViewAppointments={() => setTab('appointments')}
+            onManageAvailability={() => setTab('availability')}
+          />
+        ) : null}
+
+        {tab === 'appointments' ? (
+          <Appointments onNavigateConsultation={navigateToConsultation} />
+        ) : null}
+
+        {tab === 'availability' ? (
+          <Availability />
+        ) : null}
+
         {tab === 'patients' ? (
           <div className="split">
             <Patients patients={patients} onSelect={selectPatient} />
@@ -76,7 +114,10 @@ export default function App() {
             </div>
           </div>
         ) : null}
-        {tab === 'consultation' ? <Consultation roomId={appointments[0]?.consultation?.room_id || 'demo'} /> : null}
+
+        {tab === 'consultation' ? (
+          <Consultation roomId={consultationRoomId} />
+        ) : null}
       </section>
     </main>
   );
