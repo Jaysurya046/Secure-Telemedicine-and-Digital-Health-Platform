@@ -8,7 +8,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 
 from .models import Appointment, DoctorAvailability
-from .permissions import AppointmentAccessPermission
+from .permissions import AppointmentAccessPermission, DoctorAvailabilityAccessPermission
 from .serializers import (
     AppointmentSerializer,
     DoctorAvailabilitySerializer,
@@ -137,7 +137,7 @@ class AppointmentViewSet(viewsets.ModelViewSet):
 
 class DoctorAvailabilityViewSet(viewsets.ModelViewSet):
     serializer_class = DoctorAvailabilitySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, DoctorAvailabilityAccessPermission]
     filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
     filterset_fields = ['doctor', 'weekday', 'is_active']
     ordering_fields = ['weekday', 'start_time']
@@ -147,27 +147,19 @@ class DoctorAvailabilityViewSet(viewsets.ModelViewSet):
         queryset = DoctorAvailability.objects.select_related(
             'doctor', 'doctor__profile', 'doctor__doctor_profile'
         )
-        if self.request.user.role == 'doctor':
-            return queryset.filter(doctor=self.request.user)
-        return queryset.filter(is_active=True)
+        user = getattr(self.request, 'user', None)
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        if user.role == 'admin':
+            return queryset
+        if user.role == 'doctor':
+            return queryset.filter(doctor=user)
+        if user.role == 'patient':
+            return queryset.filter(is_active=True)
+        return queryset.none()
 
     def perform_create(self, serializer):
         if self.request.user.role == 'doctor':
             serializer.save(doctor=self.request.user)
         else:
             serializer.save()
-
-    def create(self, request, *args, **kwargs):
-        if request.user.role not in ['doctor', 'admin']:
-            return Response({'error': 'Only doctors or admins can manage availability.'}, status=status.HTTP_403_FORBIDDEN)
-        return super().create(request, *args, **kwargs)
-
-    def update(self, request, *args, **kwargs):
-        if request.user.role not in ['doctor', 'admin']:
-            return Response({'error': 'Only doctors or admins can manage availability.'}, status=status.HTTP_403_FORBIDDEN)
-        return super().update(request, *args, **kwargs)
-
-    def destroy(self, request, *args, **kwargs):
-        if request.user.role not in ['doctor', 'admin']:
-            return Response({'error': 'Only doctors or admins can manage availability.'}, status=status.HTTP_403_FORBIDDEN)
-        return super().destroy(request, *args, **kwargs)

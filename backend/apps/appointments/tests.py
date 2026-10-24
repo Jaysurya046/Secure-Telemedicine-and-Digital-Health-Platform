@@ -18,8 +18,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase, APIRequestFactory
 
-from apps.appointments.models import Appointment
-from apps.appointments.permissions import AppointmentAccessPermission
+from apps.appointments.models import Appointment, DoctorAvailability
+from apps.appointments.permissions import AppointmentAccessPermission, DoctorAvailabilityAccessPermission
 
 User = get_user_model()
 
@@ -105,6 +105,13 @@ class BaseAppointmentTestCase(APITestCase):
 
     def complete_url(self, pk):
         return reverse('appointment-complete', kwargs={'pk': pk})
+
+    @property
+    def availability_list_url(self):
+        return reverse('doctor-availability-list')
+
+    def availability_detail_url(self, pk):
+        return reverse('doctor-availability-detail', kwargs={'pk': pk})
 
     def get_error_details(self, response):
         """Helper to extract field errors from standard or custom DRF responses."""
@@ -1679,4 +1686,667 @@ class AppointmentLifecycleActionValidationTests(BaseAppointmentTestCase):
         self.assertEqual(self.appointment_1.symptoms, ['cough', 'fever'])
         self.assertEqual(self.appointment_1.meeting_link, 'https://telemed.example.com/rooms/test-room')
         self.assertEqual(self.appointment_1.cancellation_reason, 'Patient emergency')
+
+
+class DoctorAvailabilitySecurityTests(BaseAppointmentTestCase):
+    """
+    Tests for Feature 4C: Secure doctor availability ownership and access.
+
+    Covers:
+    - Doctors can manage only their own availability, including inactive windows.
+    - Doctor creation derives doctor from the caller before validation. Omission succeeds; conflicting doctor IDs return 400.
+    - Admins can manage all availability, including inactive windows. Creation requires role='doctor'.
+    - Doctor ownership is immutable after creation for every role. Accept unchanged values on PUT/PATCH.
+    - Patients have read-only access to active availability. Inactive detail requests return 404.
+    - Unsupported roles receive 403; unauthenticated callers receive 401.
+    - Non-object payloads return 400 without database changes.
+    - Preserve weekday validation, end_time > start_time, filtering, ordering, and existing duplicate-window validation.
+    """
+
+    def test_doctor_creation_derives_doctor_when_omitted(self):
+        """Doctor creation derives doctor from caller when omitted."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        payload = {
+            'weekday': 0,
+            'start_time': '09:00:00',
+            'end_time': '17:00:00',
+        }
+        res = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(res.data['doctor']), str(self.doctor_1.id))
+
+        avail = DoctorAvailability.objects.get(id=res.data['id'])
+        self.assertEqual(avail.doctor, self.doctor_1)
+        self.assertEqual(avail.weekday, 0)
+        self.assertTrue(avail.is_active)
+
+    def test_doctor_creation_succeeds_with_matching_doctor_id(self):
+        """Doctor creation succeeds when supplying own doctor ID."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        payload = {
+            'doctor': str(self.doctor_1.id),
+            'weekday': 1,
+            'start_time': '09:00:00',
+            'end_time': '17:00:00',
+        }
+        res = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(res.data['doctor']), str(self.doctor_1.id))
+
+        avail = DoctorAvailability.objects.get(id=res.data['id'])
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+    def test_doctor_creation_rejects_conflicting_doctor_id_spoofing(self):
+        """Doctor creation rejects conflicting doctor ID with 400 and does not write to DB."""
+        initial_count = DoctorAvailability.objects.count()
+        self.client.force_authenticate(user=self.doctor_1)
+
+        payload = {
+            'doctor': str(self.doctor_2.id),
+            'weekday': 2,
+            'start_time': '09:00:00',
+            'end_time': '17:00:00',
+        }
+        res = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(res))
+        self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+    def test_admin_creation_requires_doctor_field(self):
+        """Admin creation requires doctor field in payload."""
+        initial_count = DoctorAvailability.objects.count()
+        self.client.force_authenticate(user=self.admin)
+
+        # Omitted doctor
+        payload = {
+            'weekday': 0,
+            'start_time': '08:00:00',
+            'end_time': '12:00:00',
+        }
+        res = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(res))
+        self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+        # Blank doctor
+        payload['doctor'] = ''
+        res2 = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(res2))
+        self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+    def test_admin_creation_validates_doctor_role(self):
+        """Admin creation requires that the specified user has role='doctor'."""
+        initial_count = DoctorAvailability.objects.count()
+        self.client.force_authenticate(user=self.admin)
+
+        # 1. Specifying a patient user
+        res1 = self.client.post(
+            self.availability_list_url,
+            {
+                'doctor': str(self.patient_1.id),
+                'weekday': 0,
+                'start_time': '08:00:00',
+                'end_time': '12:00:00',
+            },
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Selected user must be a doctor', str(self.get_error_details(res1)))
+
+        # 2. Specifying a nurse user
+        res2 = self.client.post(
+            self.availability_list_url,
+            {
+                'doctor': str(self.nurse.id),
+                'weekday': 0,
+                'start_time': '08:00:00',
+                'end_time': '12:00:00',
+            },
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Selected user must be a doctor', str(self.get_error_details(res2)))
+
+        # 3. Specifying an admin user
+        res3 = self.client.post(
+            self.availability_list_url,
+            {
+                'doctor': str(self.admin.id),
+                'weekday': 0,
+                'start_time': '08:00:00',
+                'end_time': '12:00:00',
+            },
+            format='json',
+        )
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('Selected user must be a doctor', str(self.get_error_details(res3)))
+
+        self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+    def test_admin_can_create_and_manage_all_availability_including_inactive(self):
+        """Admin can create and manage availability for any doctor, including inactive windows."""
+        self.client.force_authenticate(user=self.admin)
+
+        # Create inactive window for doctor_1
+        payload = {
+            'doctor': str(self.doctor_1.id),
+            'weekday': 4,
+            'start_time': '08:00:00',
+            'end_time': '12:00:00',
+            'is_active': False,
+        }
+        res = self.client.post(self.availability_list_url, payload, format='json')
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+        avail_id = res.data['id']
+        self.assertFalse(res.data['is_active'])
+
+        # Admin can retrieve inactive detail
+        res_get = self.client.get(self.availability_detail_url(avail_id))
+        self.assertEqual(res_get.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_get.data['is_active'])
+
+        # Admin sees inactive window in list
+        res_list = self.client.get(self.availability_list_url)
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        results = res_list.data.get('results', res_list.data)
+        ids = [str(r['id']) for r in results]
+        self.assertIn(str(avail_id), ids)
+
+        # Admin can update inactive window to active
+        res_patch = self.client.patch(
+            self.availability_detail_url(avail_id),
+            {'is_active': True},
+            format='json',
+        )
+        self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_patch.data['is_active'])
+
+        # Admin can delete window
+        res_del = self.client.delete(self.availability_detail_url(avail_id))
+        self.assertEqual(res_del.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(DoctorAvailability.objects.filter(id=avail_id).exists())
+
+    def test_doctor_ownership_immutable_after_creation_for_doctor(self):
+        """Doctor ownership is immutable after creation for doctor; accepts unchanged doctor."""
+        avail = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='17:00:00',
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. PATCH with conflicting doctor returns 400
+        res_patch_conflict = self.client.patch(
+            self.availability_detail_url(avail.id),
+            {'doctor': str(self.doctor_2.id)},
+            format='json',
+        )
+        self.assertEqual(res_patch_conflict.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(res_patch_conflict))
+        avail.refresh_from_db()
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+        # 2. PUT with unchanged doctor succeeds
+        res_put = self.client.put(
+            self.availability_detail_url(avail.id),
+            {
+                'doctor': str(self.doctor_1.id),
+                'weekday': 2,
+                'start_time': '09:00:00',
+                'end_time': '17:00:00',
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res_put.status_code, status.HTTP_200_OK)
+        avail.refresh_from_db()
+        self.assertEqual(avail.weekday, 2)
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+        # 3. PATCH with omitted doctor succeeds
+        res_patch_ok = self.client.patch(
+            self.availability_detail_url(avail.id),
+            {'weekday': 3},
+            format='json',
+        )
+        self.assertEqual(res_patch_ok.status_code, status.HTTP_200_OK)
+        avail.refresh_from_db()
+        self.assertEqual(avail.weekday, 3)
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+    def test_doctor_ownership_immutable_after_creation_for_admin(self):
+        """Doctor ownership is immutable after creation for admin; accepts unchanged doctor."""
+        avail = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time='09:00:00',
+            end_time='17:00:00',
+            is_active=True,
+        )
+        self.client.force_authenticate(user=self.admin)
+
+        # 1. PATCH with conflicting doctor returns 400
+        res_patch = self.client.patch(
+            self.availability_detail_url(avail.id),
+            {'doctor': str(self.doctor_2.id)},
+            format='json',
+        )
+        self.assertEqual(res_patch.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('doctor', self.get_error_details(res_patch))
+        avail.refresh_from_db()
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+        # 2. PUT with conflicting doctor returns 400
+        res_put_bad = self.client.put(
+            self.availability_detail_url(avail.id),
+            {
+                'doctor': str(self.doctor_2.id),
+                'weekday': 2,
+                'start_time': '09:00:00',
+                'end_time': '17:00:00',
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res_put_bad.status_code, status.HTTP_400_BAD_REQUEST)
+        avail.refresh_from_db()
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+        # 3. PUT with unchanged doctor succeeds
+        res_put_ok = self.client.put(
+            self.availability_detail_url(avail.id),
+            {
+                'doctor': str(self.doctor_1.id),
+                'weekday': 4,
+                'start_time': '09:00:00',
+                'end_time': '17:00:00',
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(res_put_ok.status_code, status.HTTP_200_OK)
+        avail.refresh_from_db()
+        self.assertEqual(avail.weekday, 4)
+        self.assertEqual(avail.doctor, self.doctor_1)
+
+    def test_cross_doctor_access_boundaries(self):
+        """Doctor 1 cannot view, edit, or delete Doctor 2's availability."""
+        w1 = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+        w2 = DoctorAvailability.objects.create(
+            doctor=self.doctor_2,
+            weekday=1,
+            start_time='13:00:00',
+            end_time='17:00:00',
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # List returns only doctor 1's windows
+        res_list = self.client.get(self.availability_list_url)
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        results = res_list.data.get('results', res_list.data)
+        ids = [str(r['id']) for r in results]
+        self.assertIn(str(w1.id), ids)
+        self.assertNotIn(str(w2.id), ids)
+
+        # Detail GET on Doctor 2's window returns 404
+        self.assertEqual(
+            self.client.get(self.availability_detail_url(w2.id)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+        # PATCH on Doctor 2's window returns 404
+        self.assertEqual(
+            self.client.patch(
+                self.availability_detail_url(w2.id),
+                {'weekday': 5},
+                format='json',
+            ).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        w2.refresh_from_db()
+        self.assertEqual(w2.weekday, 1)
+
+        # DELETE on Doctor 2's window returns 404
+        self.assertEqual(
+            self.client.delete(self.availability_detail_url(w2.id)).status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+        self.assertTrue(DoctorAvailability.objects.filter(id=w2.id).exists())
+
+    def test_doctor_can_manage_own_inactive_windows(self):
+        """Doctors can view and manage their own inactive windows."""
+        w = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time='10:00:00',
+            end_time='14:00:00',
+            is_active=False,
+        )
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # List includes own inactive window
+        res_list = self.client.get(self.availability_list_url)
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        results = res_list.data.get('results', res_list.data)
+        ids = [str(r['id']) for r in results]
+        self.assertIn(str(w.id), ids)
+
+        # Detail GET succeeds on own inactive window
+        res_detail = self.client.get(self.availability_detail_url(w.id))
+        self.assertEqual(res_detail.status_code, status.HTTP_200_OK)
+        self.assertFalse(res_detail.data['is_active'])
+
+        # Doctor can reactivate window
+        res_patch = self.client.patch(
+            self.availability_detail_url(w.id),
+            {'is_active': True},
+            format='json',
+        )
+        self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+        w.refresh_from_db()
+        self.assertTrue(w.is_active)
+
+    def test_patient_read_only_access_to_active_availability_only(self):
+        """Patients have read-only access to active availability; inactive detail returns 404."""
+        w_active = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+        w_inactive = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='13:00:00',
+            end_time='17:00:00',
+            is_active=False,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+
+        # List returns only active windows
+        res_list = self.client.get(self.availability_list_url)
+        self.assertEqual(res_list.status_code, status.HTTP_200_OK)
+        results = res_list.data.get('results', res_list.data)
+        ids = [str(r['id']) for r in results]
+        self.assertIn(str(w_active.id), ids)
+        self.assertNotIn(str(w_inactive.id), ids)
+
+        # Detail GET on active window succeeds
+        res_detail = self.client.get(self.availability_detail_url(w_active.id))
+        self.assertEqual(res_detail.status_code, status.HTTP_200_OK)
+        self.assertTrue(res_detail.data['is_active'])
+
+        # Detail GET on inactive window returns 404
+        res_inactive = self.client.get(self.availability_detail_url(w_inactive.id))
+        self.assertEqual(res_inactive.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_patient_write_requests_denied_with_403(self):
+        """Patient write requests (create, update, delete) return 403 Forbidden without DB changes."""
+        w = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+        initial_count = DoctorAvailability.objects.count()
+
+        self.client.force_authenticate(user=self.patient_1)
+
+        # 1. POST create
+        res_post = self.client.post(
+            self.availability_list_url,
+            {'weekday': 2, 'start_time': '09:00:00', 'end_time': '12:00:00'},
+            format='json',
+        )
+        self.assertEqual(res_post.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+        # 2. PUT update
+        res_put = self.client.put(
+            self.availability_detail_url(w.id),
+            {'weekday': 2, 'start_time': '09:00:00', 'end_time': '12:00:00', 'is_active': True},
+            format='json',
+        )
+        self.assertEqual(res_put.status_code, status.HTTP_403_FORBIDDEN)
+        w.refresh_from_db()
+        self.assertEqual(w.weekday, 1)
+
+        # 3. PATCH partial update
+        res_patch = self.client.patch(
+            self.availability_detail_url(w.id),
+            {'weekday': 3},
+            format='json',
+        )
+        self.assertEqual(res_patch.status_code, status.HTTP_403_FORBIDDEN)
+        w.refresh_from_db()
+        self.assertEqual(w.weekday, 1)
+
+        # 4. DELETE
+        res_del = self.client.delete(self.availability_detail_url(w.id))
+        self.assertEqual(res_del.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(DoctorAvailability.objects.filter(id=w.id).exists())
+
+    def test_unsupported_roles_and_unauthenticated_callers(self):
+        """Unauthenticated callers receive 401; unsupported roles receive 403."""
+        w = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+
+        # 1. Unauthenticated (401)
+        self.client.logout()
+        self.assertEqual(self.client.get(self.availability_list_url).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.get(self.availability_detail_url(w.id)).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(
+            self.client.post(self.availability_list_url, {'weekday': 1}, format='json').status_code,
+            status.HTTP_401_UNAUTHORIZED,
+        )
+        self.assertEqual(self.client.delete(self.availability_detail_url(w.id)).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 2. Unsupported role: Nurse (403)
+        self.client.force_authenticate(user=self.nurse)
+        self.assertEqual(self.client.get(self.availability_list_url).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.get(self.availability_detail_url(w.id)).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(
+            self.client.post(self.availability_list_url, {'weekday': 1}, format='json').status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+        self.assertEqual(self.client.delete(self.availability_detail_url(w.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_non_object_payloads_return_400_and_preserve_db(self):
+        """Non-object payloads (strings, null, arrays, numbers) return 400 without DB changes."""
+        w = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+        initial_count = DoctorAvailability.objects.count()
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        bad_payloads = ['""', 'null', '[]', '123']
+        for bad_body in bad_payloads:
+            with self.subTest(action='create', body=bad_body):
+                res = self.client.post(
+                    self.availability_list_url,
+                    data=bad_body,
+                    content_type='application/json',
+                )
+                self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertEqual(DoctorAvailability.objects.count(), initial_count)
+
+            with self.subTest(action='patch', body=bad_body):
+                res = self.client.patch(
+                    self.availability_detail_url(w.id),
+                    data=bad_body,
+                    content_type='application/json',
+                )
+                self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+                w.refresh_from_db()
+                self.assertEqual(w.weekday, 1)
+
+        # Admin PUT with non-object JSON
+        self.client.force_authenticate(user=self.admin)
+        for bad_body in bad_payloads:
+            with self.subTest(action='admin_put', body=bad_body):
+                res = self.client.put(
+                    self.availability_detail_url(w.id),
+                    data=bad_body,
+                    content_type='application/json',
+                )
+                self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+                w.refresh_from_db()
+                self.assertEqual(w.weekday, 1)
+
+    def test_weekday_and_time_validation(self):
+        """Preserve weekday choice validation and end_time > start_time validation."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. Invalid weekday (> 6)
+        res1 = self.client.post(
+            self.availability_list_url,
+            {'weekday': 7, 'start_time': '09:00:00', 'end_time': '17:00:00'},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('weekday', self.get_error_details(res1))
+
+        # 2. Invalid weekday (< 0)
+        res2 = self.client.post(
+            self.availability_list_url,
+            {'weekday': -1, 'start_time': '09:00:00', 'end_time': '17:00:00'},
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. end_time <= start_time (end before start)
+        res3 = self.client.post(
+            self.availability_list_url,
+            {'weekday': 0, 'start_time': '17:00:00', 'end_time': '09:00:00'},
+            format='json',
+        )
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('end_time', self.get_error_details(res3))
+
+        # 4. end_time == start_time (equal)
+        res4 = self.client.post(
+            self.availability_list_url,
+            {'weekday': 0, 'start_time': '09:00:00', 'end_time': '09:00:00'},
+            format='json',
+        )
+        self.assertEqual(res4.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('end_time', self.get_error_details(res4))
+
+    def test_duplicate_window_validation(self):
+        """Preserve unique_together duplicate window validation."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=0,
+            start_time='09:00:00',
+            end_time='17:00:00',
+            is_active=True,
+        )
+
+        # Doctor 1 tries to create exact duplicate -> 400
+        self.client.force_authenticate(user=self.doctor_1)
+        res_dup = self.client.post(
+            self.availability_list_url,
+            {'weekday': 0, 'start_time': '09:00:00', 'end_time': '17:00:00'},
+            format='json',
+        )
+        self.assertEqual(res_dup.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Doctor 2 can create same weekday/time -> 201
+        self.client.force_authenticate(user=self.doctor_2)
+        res_doc2 = self.client.post(
+            self.availability_list_url,
+            {'weekday': 0, 'start_time': '09:00:00', 'end_time': '17:00:00'},
+            format='json',
+        )
+        self.assertEqual(res_doc2.status_code, status.HTTP_201_CREATED)
+
+        # Admin creating duplicate for Doctor 1 -> 400
+        self.client.force_authenticate(user=self.admin)
+        res_admin_dup = self.client.post(
+            self.availability_list_url,
+            {
+                'doctor': str(self.doctor_1.id),
+                'weekday': 0,
+                'start_time': '09:00:00',
+                'end_time': '17:00:00',
+            },
+            format='json',
+        )
+        self.assertEqual(res_admin_dup.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_filtering_and_ordering(self):
+        """Preserve filtering by doctor, weekday, is_active and ordering by weekday, start_time."""
+        w1 = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=4,
+            start_time='10:00:00',
+            end_time='14:00:00',
+            is_active=True,
+        )
+        w2 = DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time='09:00:00',
+            end_time='12:00:00',
+            is_active=True,
+        )
+        w3 = DoctorAvailability.objects.create(
+            doctor=self.doctor_2,
+            weekday=1,
+            start_time='14:00:00',
+            end_time='18:00:00',
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.admin)
+
+        # Filter by weekday=1
+        res_weekday = self.client.get(self.availability_list_url + '?weekday=1')
+        self.assertEqual(res_weekday.status_code, status.HTTP_200_OK)
+        results = res_weekday.data.get('results', res_weekday.data)
+        ids = [str(r['id']) for r in results]
+        self.assertIn(str(w2.id), ids)
+        self.assertIn(str(w3.id), ids)
+        self.assertNotIn(str(w1.id), ids)
+
+        # Filter by doctor=doctor_1
+        res_doc = self.client.get(f'{self.availability_list_url}?doctor={self.doctor_1.id}')
+        self.assertEqual(res_doc.status_code, status.HTTP_200_OK)
+        results_doc = res_doc.data.get('results', res_doc.data)
+        ids_doc = [str(r['id']) for r in results_doc]
+        self.assertIn(str(w1.id), ids_doc)
+        self.assertIn(str(w2.id), ids_doc)
+        self.assertNotIn(str(w3.id), ids_doc)
+
+        # Ordering by weekday, start_time: w2 (weekday 1, 09:00) before w1 (weekday 4, 10:00)
+        idx_w2 = ids_doc.index(str(w2.id))
+        idx_w1 = ids_doc.index(str(w1.id))
+        self.assertLess(idx_w2, idx_w1)
+
 

@@ -155,13 +155,63 @@ class DoctorAvailabilitySerializer(serializers.ModelSerializer):
             'end_time', 'is_active', 'created_at', 'updated_at',
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'doctor': {'required': False},
+        }
+
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            raise serializers.ValidationError({'non_field_errors': ['Expected an object.']})
+
+        if hasattr(data, 'copy'):
+            data = data.copy()
+        else:
+            data = dict(data)
+
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+
+        if self.instance is None and user and user.is_authenticated:
+            # Doctor creation derives doctor from the caller before validation.
+            # Omission succeeds; conflicting doctor IDs return 400.
+            if getattr(user, 'role', None) == 'doctor':
+                if 'doctor' in data and data['doctor'] not in (None, ''):
+                    raw_doctor = data['doctor']
+                    raw_doctor_id = getattr(raw_doctor, 'id', raw_doctor)
+                    if str(raw_doctor_id) != str(user.id):
+                        raise serializers.ValidationError({
+                            'doctor': 'You cannot manage availability for another doctor.'
+                        })
+                data['doctor'] = user.id
+
+            # Admins can manage all availability. Creation requires a user with role='doctor'.
+            elif getattr(user, 'role', None) == 'admin':
+                if 'doctor' not in data or data['doctor'] in (None, ''):
+                    raise serializers.ValidationError({
+                        'doctor': 'Doctor is required.'
+                    })
+
+        return super().to_internal_value(data)
 
     def validate_doctor(self, value):
-        if value.role != 'doctor':
+        if getattr(value, 'role', None) != 'doctor':
             raise serializers.ValidationError('Selected user must be a doctor.')
         return value
 
     def validate(self, attrs):
+        # Update validation (PUT/PATCH)
+        if self.instance is not None:
+            if hasattr(self, 'initial_data') and isinstance(self.initial_data, Mapping):
+                # Doctor ownership is immutable after creation for every role.
+                # Accept unchanged values on PUT/PATCH.
+                if 'doctor' in self.initial_data:
+                    new_doctor = attrs.get('doctor')
+                    if new_doctor is not None and new_doctor != self.instance.doctor:
+                        raise serializers.ValidationError({
+                            'doctor': 'Doctor cannot be changed after creation.'
+                        })
+            attrs['doctor'] = self.instance.doctor
+
         start_time = attrs.get('start_time', getattr(self.instance, 'start_time', None))
         end_time = attrs.get('end_time', getattr(self.instance, 'end_time', None))
         if start_time and end_time and end_time <= start_time:
