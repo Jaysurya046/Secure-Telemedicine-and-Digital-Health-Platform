@@ -1392,6 +1392,191 @@ class AppointmentLifecycleActionValidationTests(BaseAppointmentTestCase):
         self.assertEqual(self.appointment_1.status, 'pending')
 
     # =========================================================================
+    # 5b. Cancellation Reason Omission & Stored Reason Preservation Regressions
+    # =========================================================================
+
+    def test_cancel_with_omitted_reason_preserves_stored_cancellation_reason(self):
+        """JSON {}, empty multipart, and bodyless cancellation preserve non-empty stored reason."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        # 1. JSON {} preserves stored reason
+        self.appointment_1.status = 'pending'
+        self.appointment_1.cancellation_reason = 'Original prior reason'
+        self.appointment_1.save()
+
+        res1 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Original prior reason')
+        self.assertEqual(res1.data['cancellation_reason'], 'Original prior reason')
+
+        # 2. Empty multipart preserves stored reason
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.cancellation_reason = 'Original prior reason'
+        self.appointment_1.save()
+
+        res2 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={},
+            format='multipart',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Original prior reason')
+        self.assertEqual(res2.data['cancellation_reason'], 'Original prior reason')
+
+        # 3. Bodyless cancellation preserves stored reason
+        self.appointment_1.status = 'pending'
+        self.appointment_1.cancellation_reason = 'Original prior reason'
+        self.appointment_1.save()
+
+        res3 = self.client.post(self.cancel_url(self.appointment_1.id))
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Original prior reason')
+        self.assertEqual(res3.data['cancellation_reason'], 'Original prior reason')
+
+    def test_cancel_with_explicit_blank_clears_stored_cancellation_reason(self):
+        """Explicit "" clears a non-empty stored cancellation_reason."""
+        self.client.force_authenticate(user=self.patient_1)
+        self.appointment_1.status = 'pending'
+        self.appointment_1.cancellation_reason = 'Prior reason to be cleared'
+        self.appointment_1.save()
+
+        res = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': ''},
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, '')
+        self.assertEqual(res.data['cancellation_reason'], '')
+
+    def test_cancel_with_explicit_text_replaces_stored_cancellation_reason(self):
+        """Explicit non-empty text replaces a non-empty stored cancellation_reason."""
+        self.client.force_authenticate(user=self.patient_1)
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.cancellation_reason = 'Old reason'
+        self.appointment_1.save()
+
+        res = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': 'Brand new cancellation reason'},
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Brand new cancellation reason')
+        self.assertEqual(res.data['cancellation_reason'], 'Brand new cancellation reason')
+
+    def test_cancel_invalid_payloads_and_transitions_preserve_entire_row(self):
+        """Invalid payloads and invalid transitions preserve the entire row starting with a non-empty stored reason."""
+        self.client.force_authenticate(user=self.patient_1)
+        self.appointment_1.status = 'pending'
+        self.appointment_1.reason = 'Headache check'
+        self.appointment_1.cancellation_reason = 'Stored active reason'
+        self.appointment_1.notes = 'Pre-existing clinical notes'
+        self.appointment_1.symptoms = 'Throbbing headache'
+        self.appointment_1.meeting_link = 'https://telehealth.local/meet/123'
+        self.appointment_1.save()
+        self.appointment_1.refresh_from_db()
+        initial_updated_at = self.appointment_1.updated_at
+
+        # 1. Invalid payload: extra unknown fields -> 400
+        res1 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': 'New reason', 'extra_field': 'malicious'},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'pending')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Stored active reason')
+        self.assertEqual(self.appointment_1.notes, 'Pre-existing clinical notes')
+        self.assertEqual(self.appointment_1.symptoms, 'Throbbing headache')
+        self.assertEqual(self.appointment_1.reason, 'Headache check')
+        self.assertEqual(self.appointment_1.meeting_link, 'https://telehealth.local/meet/123')
+        self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+
+        # 2. Invalid payload: non-string (numeric, null, structured) -> 400
+        for bad_val in [None, 1234, {'key': 'val'}, ['list']]:
+            res = self.client.post(
+                self.cancel_url(self.appointment_1.id),
+                data={'cancellation_reason': bad_val},
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.appointment_1.refresh_from_db()
+            self.assertEqual(self.appointment_1.status, 'pending')
+            self.assertEqual(self.appointment_1.cancellation_reason, 'Stored active reason')
+            self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+
+        # 3. Invalid payload: non-object JSON ("" or "null" or "[]") -> 400
+        for bad_body in ['""', 'null', '[]']:
+            res = self.client.post(
+                self.cancel_url(self.appointment_1.id),
+                data=bad_body,
+                content_type='application/json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.appointment_1.refresh_from_db()
+            self.assertEqual(self.appointment_1.status, 'pending')
+            self.assertEqual(self.appointment_1.cancellation_reason, 'Stored active reason')
+            self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+
+        # 4. Invalid transition: completed appointment cannot be cancelled -> 409
+        self.appointment_1.status = 'completed'
+        self.appointment_1.save()
+        self.appointment_1.refresh_from_db()
+        completed_updated_at = self.appointment_1.updated_at
+
+        res_trans1 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': 'Attempt to cancel completed'},
+            format='json',
+        )
+        self.assertEqual(res_trans1.status_code, status.HTTP_409_CONFLICT)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'completed')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Stored active reason')
+        self.assertEqual(self.appointment_1.notes, 'Pre-existing clinical notes')
+        self.assertEqual(self.appointment_1.symptoms, 'Throbbing headache')
+        self.assertEqual(self.appointment_1.reason, 'Headache check')
+        self.assertEqual(self.appointment_1.meeting_link, 'https://telehealth.local/meet/123')
+        self.assertEqual(self.appointment_1.updated_at, completed_updated_at)
+
+        # 5. Invalid transition: cancelled appointment cannot be cancelled again -> 409
+        self.appointment_1.status = 'cancelled'
+        self.appointment_1.save()
+        self.appointment_1.refresh_from_db()
+        cancelled_updated_at = self.appointment_1.updated_at
+
+        res_trans2 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={},
+            format='json',
+        )
+        self.assertEqual(res_trans2.status_code, status.HTTP_409_CONFLICT)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Stored active reason')
+        self.assertEqual(self.appointment_1.notes, 'Pre-existing clinical notes')
+        self.assertEqual(self.appointment_1.symptoms, 'Throbbing headache')
+        self.assertEqual(self.appointment_1.reason, 'Headache check')
+        self.assertEqual(self.appointment_1.meeting_link, 'https://telehealth.local/meet/123')
+        self.assertEqual(self.appointment_1.updated_at, cancelled_updated_at)
+
+    # =========================================================================
     # 6. Preserved Role Restrictions & Participant-Scoped Access
     # =========================================================================
 

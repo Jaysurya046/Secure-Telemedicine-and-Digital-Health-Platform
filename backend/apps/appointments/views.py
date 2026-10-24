@@ -101,8 +101,11 @@ class AppointmentViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_409_CONFLICT,
                 )
             locked.status = 'cancelled'
-            locked.cancellation_reason = serializer.validated_data.get('cancellation_reason', '')
-            locked.save(update_fields=['status', 'cancellation_reason', 'updated_at'])
+            update_fields = ['status', 'updated_at']
+            if 'cancellation_reason' in serializer.validated_data:
+                locked.cancellation_reason = serializer.validated_data['cancellation_reason']
+                update_fields.append('cancellation_reason')
+            locked.save(update_fields=update_fields)
             return Response(self.get_serializer(locked).data)
 
     @action(detail=True, methods=['post'])
