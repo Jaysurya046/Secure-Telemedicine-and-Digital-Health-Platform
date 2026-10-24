@@ -80,6 +80,7 @@ class AppointmentSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         request = self.context.get('request')
         user = getattr(request, 'user', None)
+        is_rescheduling = False
 
         # Creation validation
         if self.instance is None:
@@ -165,6 +166,34 @@ class AppointmentSerializer(serializers.ModelSerializer):
         doctor = attrs.get('doctor', getattr(self.instance, 'doctor', None))
         if scheduled_start and scheduled_end and scheduled_end <= scheduled_start:
             raise serializers.ValidationError({'scheduled_end': 'End time must be after start time.'})
+
+        # Feature 4E: Availability window validation
+        # Runs on creation and actual datetime changes (rescheduling)
+        validate_availability = (self.instance is None) or is_rescheduling
+        if validate_availability and scheduled_start and scheduled_end and doctor:
+            tz = timezone.get_default_timezone()
+            start_local = scheduled_start.astimezone(tz) if timezone.is_aware(scheduled_start) else timezone.make_aware(scheduled_start, tz)
+            end_local = scheduled_end.astimezone(tz) if timezone.is_aware(scheduled_end) else timezone.make_aware(scheduled_end, tz)
+
+            # Reject appointments crossing midnight in the configured timezone
+            if start_local.date() != end_local.date():
+                raise serializers.ValidationError({
+                    'scheduled_end': 'Appointments crossing midnight are not supported.'
+                })
+
+            # Check that entire appointment fits inside one active doctor availability window
+            matching_window = DoctorAvailability.objects.filter(
+                doctor=doctor,
+                is_active=True,
+                weekday=start_local.weekday(),
+                start_time__lte=start_local.time(),
+                end_time__gte=end_local.time(),
+            )
+            if not matching_window.exists():
+                raise serializers.ValidationError({
+                    'scheduled_start': 'Appointment time must fall within an active doctor availability window.'
+                })
+
         if doctor and scheduled_start and scheduled_end:
             conflicts = Appointment.objects.filter(
                 doctor=doctor,

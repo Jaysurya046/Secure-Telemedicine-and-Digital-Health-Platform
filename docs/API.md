@@ -688,3 +688,12 @@ For interactive API testing, visit:
 5. All other requests use application/json
 6. JWT access tokens expire in 15 minutes
 7. JWT refresh tokens expire in 7 days
+
+---
+
+## Appointment Scheduling & Timezone Handling
+
+- **Timezone Alignment**: Appointment scheduling matches doctor availability windows using Django's configured default timezone (`settings.TIME_ZONE`, currently UTC). Aware datetimes submitted with different UTC offsets are converted to the configured default timezone before comparing weekday and time boundaries.
+- **Active Window Fitting**: On appointment creation and actual datetime changes (rescheduling), the entire appointment must fit inside one active availability window (`is_active=True`) belonging to its doctor. Exact boundaries are permitted (`appointment start >= window start` and `appointment end <= window end`).
+- **Midnight Crossing & Separate Windows**: Appointments crossing midnight in the configured timezone are rejected. Separate availability windows cannot be combined to cover an appointment.
+- **Unchanged Edits & Historical Bookings**: Unrelated updates (such as notes) and unchanged timestamps (including equivalent timestamps expressed with different UTC offsets) do not revalidate doctor availability on existing appointments.

@@ -11,7 +11,7 @@ Covers:
 - Deny unsupported roles and unauthenticated callers; participant-scoped access preserved.
 - Patient portal actual booking payload, malformed bodies, and DB immutability after rejection.
 """
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import datetime, timedelta, time, timezone as dt_timezone
 from unittest.mock import patch
 from django.contrib.auth import get_user_model
 from django.urls import reverse
@@ -71,6 +71,17 @@ class BaseAppointmentTestCase(APITestCase):
 
         # URLs
         self.list_url = reverse('appointment-list')
+
+        # Baseline active availability windows for doctor_1 and doctor_2 covering all days
+        for doc in (self.doctor_1, self.doctor_2):
+            for day in range(7):
+                DoctorAvailability.objects.create(
+                    doctor=doc,
+                    weekday=day,
+                    start_time=time(0, 0, 0),
+                    end_time=time(23, 59, 59),
+                    is_active=True,
+                )
 
         # Baseline appointment between doctor_1 and patient_1
         now = timezone.now()
@@ -1704,6 +1715,10 @@ class DoctorAvailabilitySecurityTests(BaseAppointmentTestCase):
     - Preserve weekday validation, end_time > start_time, filtering, ordering, and existing duplicate-window validation.
     """
 
+    def setUp(self):
+        super().setUp()
+        DoctorAvailability.objects.all().delete()
+
     def test_doctor_creation_derives_doctor_when_omitted(self):
         """Doctor creation derives doctor from caller when omitted."""
         self.client.force_authenticate(user=self.doctor_1)
@@ -2531,9 +2546,9 @@ class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
         self.client.force_authenticate(user=self.patient_1)
 
         with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
-            # Baseline: Day 2 from 10:00 to 11:00
-            start_dt = self.FIXED_NOW + timedelta(days=2, hours=10)
-            end_dt = self.FIXED_NOW + timedelta(days=2, hours=11)
+            # Baseline: Day 2 from 13:00 to 14:00 (relative to FIXED_NOW 12:00)
+            start_dt = self.FIXED_NOW + timedelta(days=2, hours=1)
+            end_dt = self.FIXED_NOW + timedelta(days=2, hours=2)
             appt = Appointment.objects.create(
                 patient=self.patient_1,
                 doctor=self.doctor_1,
@@ -2542,7 +2557,7 @@ class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
                 status='pending',
             )
 
-            # 1. Update only scheduled_start to 10:30 (valid since 10:30 < existing end 11:00)
+            # 1. Update only scheduled_start to 13:30 (valid since 13:30 < existing end 14:00)
             res1 = self.client.patch(
                 self.detail_url(appt.id),
                 {'scheduled_start': (start_dt + timedelta(minutes=30)).isoformat()},
@@ -2553,10 +2568,10 @@ class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
             self.assertEqual(appt.scheduled_start, start_dt + timedelta(minutes=30))
             self.assertEqual(appt.scheduled_end, end_dt)
 
-            # 2. Update only scheduled_start to 12:00 (invalid since 12:00 >= existing end 11:00)
+            # 2. Update only scheduled_start to 15:00 (invalid since 15:00 >= existing end 14:00)
             res2 = self.client.patch(
                 self.detail_url(appt.id),
-                {'scheduled_start': (self.FIXED_NOW + timedelta(days=2, hours=12)).isoformat()},
+                {'scheduled_start': (self.FIXED_NOW + timedelta(days=2, hours=3)).isoformat()},
                 format='json',
             )
             self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
@@ -2564,15 +2579,15 @@ class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
             appt.refresh_from_db()
             self.assertEqual(appt.scheduled_start, start_dt + timedelta(minutes=30))
 
-            # 3. Update only scheduled_end to 12:00 (valid since 12:00 > existing start 10:30)
+            # 3. Update only scheduled_end to 15:00 (valid since 15:00 > existing start 13:30)
             res3 = self.client.patch(
                 self.detail_url(appt.id),
-                {'scheduled_end': (self.FIXED_NOW + timedelta(days=2, hours=12)).isoformat()},
+                {'scheduled_end': (self.FIXED_NOW + timedelta(days=2, hours=3)).isoformat()},
                 format='json',
             )
             self.assertEqual(res3.status_code, status.HTTP_200_OK)
             appt.refresh_from_db()
-            self.assertEqual(appt.scheduled_end, self.FIXED_NOW + timedelta(days=2, hours=12))
+            self.assertEqual(appt.scheduled_end, self.FIXED_NOW + timedelta(days=2, hours=3))
 
             # 4. Partial update of scheduled_end on a pending appointment with past start time fails
             past_start = self.FIXED_NOW - timedelta(days=1)
@@ -2740,6 +2755,575 @@ class AppointmentReschedulingAndPastBookingTests(BaseAppointmentTestCase):
             )
             self.assertEqual(res_overlap.status_code, status.HTTP_400_BAD_REQUEST)
             self.assertIn('already has an appointment', str(res_overlap.data))
+
+
+class AppointmentAvailabilityValidationTests(BaseAppointmentTestCase):
+    """
+    Tests for Feature 4E: Require bookings to fit active doctor availability.
+
+    Covers:
+    - Entire appointment must fit inside one active availability window belonging to its doctor.
+    - Match weekday and times using Django's configured default timezone (settings.TIME_ZONE, currently UTC).
+    - Allow exact window boundaries: appointment start >= window start and appointment end <= window end.
+    - Reject missing availability, inactive windows, wrong weekday/doctor, and appointments extending outside a window.
+    - Reject appointments crossing midnight in the configured timezone. Do not combine separate windows.
+    - Apply same rules to patients, doctors, and admins.
+    - Unrelated updates and unchanged timestamps must not revalidate availability on existing appointments.
+    - Rejections return HTTP 400 without database changes.
+    - Boundaries, gaps between windows, offset conversion across weekdays, partial rescheduling, unchanged historical edits.
+    """
+
+    FIXED_NOW = datetime(2026, 11, 1, 12, 0, 0, tzinfo=dt_timezone.utc)  # Sunday 12:00:00 UTC
+
+    def setUp(self):
+        super().setUp()
+        # Clear default all-day windows so availability validation tests control their exact setup
+        DoctorAvailability.objects.all().delete()
+
+    def test_exact_window_boundaries_succeeds(self):
+        """Appointment start and end exactly matching active availability window boundaries succeeds."""
+        # Window: Tuesday (1) 09:00:00 to 17:00:00
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T09:00:00Z',
+                    'scheduled_end': '2026-11-03T17:00:00Z',
+                    'reason': 'Exact boundary appointment',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Appointment.objects.count(), initial_count + 1)
+            appt = Appointment.objects.get(id=res.data['id'])
+            self.assertEqual(appt.status, 'pending')
+            self.assertEqual(appt.scheduled_start, datetime(2026, 11, 3, 9, 0, 0, tzinfo=dt_timezone.utc))
+            self.assertEqual(appt.scheduled_end, datetime(2026, 11, 3, 17, 0, 0, tzinfo=dt_timezone.utc))
+
+    def test_strictly_inside_window_boundaries_succeeds(self):
+        """Appointment strictly inside active availability window boundaries succeeds."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T10:00:00Z',
+                    'scheduled_end': '2026-11-03T16:00:00Z',
+                    'reason': 'Interior appointment',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Appointment.objects.count(), initial_count + 1)
+
+    def test_appointment_start_before_window_start_rejected(self):
+        """Appointment starting before active window start time is rejected with 400 and leaves DB unchanged."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T08:59:00Z',
+                    'scheduled_end': '2026-11-03T11:00:00Z',
+                    'reason': 'Early start attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_appointment_end_after_window_end_rejected(self):
+        """Appointment ending after active window end time is rejected with 400 and leaves DB unchanged."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T15:00:00Z',
+                    'scheduled_end': '2026-11-03T17:01:00Z',
+                    'reason': 'Late end attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_appointment_in_gap_between_separate_windows_rejected(self):
+        """Appointment falling in gap between separate availability windows is rejected with 400."""
+        # Wednesday (2) has two windows with a 1-hour gap
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time=time(9, 0, 0),
+            end_time=time(12, 0, 0),
+            is_active=True,
+        )
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time=time(13, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-04T12:15:00Z',
+                    'scheduled_end': '2026-11-04T12:45:00Z',
+                    'reason': 'Gap appointment attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_do_not_combine_separate_windows_rejected(self):
+        """Appointment spanning across multiple separate windows cannot combine them and is rejected with 400."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time=time(9, 0, 0),
+            end_time=time(12, 0, 0),
+            is_active=True,
+        )
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=2,
+            start_time=time(13, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-04T11:00:00Z',
+                    'scheduled_end': '2026-11-04T14:00:00Z',
+                    'reason': 'Spanning windows attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_inactive_window_rejected(self):
+        """Inactive doctor availability window is rejected with 400."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=3,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=False,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-05T10:00:00Z',
+                    'scheduled_end': '2026-11-05T11:00:00Z',
+                    'reason': 'Inactive window attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_wrong_doctor_availability_rejected(self):
+        """Active window belonging to another doctor cannot be used; rejected with 400."""
+        # Active window belongs to doctor_2
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_2,
+            weekday=4,
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        # Attempt to book doctor_1
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-06T10:00:00Z',
+                    'scheduled_end': '2026-11-06T11:00:00Z',
+                    'reason': 'Wrong doctor window attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_missing_availability_on_weekday_rejected(self):
+        """Requesting appointment on weekday where doctor has no availability is rejected with 400."""
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=0,  # Monday only
+            start_time=time(9, 0, 0),
+            end_time=time(17, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        # Attempt booking on Saturday Nov 7
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-07T10:00:00Z',
+                    'scheduled_end': '2026-11-07T11:00:00Z',
+                    'reason': 'Missing availability day attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_appointment_crossing_midnight_in_configured_timezone_rejected(self):
+        """Appointments crossing midnight in the configured default timezone (UTC) are rejected with 400."""
+        # Windows on Monday night and Tuesday morning
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=0,
+            start_time=time(20, 0, 0),
+            end_time=time(23, 59, 59),
+            is_active=True,
+        )
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(0, 0, 0),
+            end_time=time(6, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        # 23:00 Monday to 01:00 Tuesday UTC
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            res = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-02T23:00:00Z',
+                    'scheduled_end': '2026-11-03T01:00:00Z',
+                    'reason': 'Midnight crossing attempt',
+                },
+                format='json',
+            )
+            self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_end', self.get_error_details(res))
+            self.assertIn('crossing midnight', str(self.get_error_details(res)['scheduled_end']))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+    def test_offset_conversion_across_weekdays_matches_utc_window(self):
+        """
+        Aware appointment datetimes are converted to configured default timezone (UTC) before matching.
+        A datetime that appears as Wednesday in +05:30 matches Tuesday UTC availability.
+        """
+        # Active availability on Tuesday (1) from 18:00:00 to 22:00:00 UTC
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(18, 0, 0),
+            end_time=time(22, 0, 0),
+            is_active=True,
+        )
+
+        self.client.force_authenticate(user=self.patient_1)
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # Wednesday Nov 4 at 01:00:00+05:30 == Tuesday Nov 3 at 19:30:00 UTC
+            # Wednesday Nov 4 at 02:00:00+05:30 == Tuesday Nov 3 at 20:30:00 UTC
+            res_valid = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-04T01:00:00+05:30',
+                    'scheduled_end': '2026-11-04T02:00:00+05:30',
+                    'reason': 'Offset conversion across weekdays test',
+                },
+                format='json',
+            )
+            self.assertEqual(res_valid.status_code, status.HTTP_201_CREATED)
+            self.assertEqual(Appointment.objects.count(), initial_count + 1)
+            appt = Appointment.objects.get(id=res_valid.data['id'])
+            # Stored start must equal 19:30:00 UTC
+            self.assertEqual(appt.scheduled_start, datetime(2026, 11, 3, 19, 30, 0, tzinfo=dt_timezone.utc))
+
+            # Wednesday in +05:30 that converts to Tuesday 04:30:00 UTC (outside 18:00-22:00 window)
+            res_invalid = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': '2026-11-03T10:00:00+05:30',
+                    'scheduled_end': '2026-11-03T11:00:00+05:30',
+                    'reason': 'Offset conversion outside window test',
+                },
+                format='json',
+            )
+            self.assertEqual(res_invalid.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_invalid))
+            self.assertEqual(Appointment.objects.count(), initial_count + 1)
+
+    def test_partial_rescheduling_validates_against_availability(self):
+        """Partial rescheduling (PATCH) validates effective start and end against active doctor availability."""
+        # Tuesday 09:00:00 to 12:00:00 window
+        DoctorAvailability.objects.create(
+            doctor=self.doctor_1,
+            weekday=1,
+            start_time=time(9, 0, 0),
+            end_time=time(12, 0, 0),
+            is_active=True,
+        )
+
+        appt = Appointment.objects.create(
+            patient=self.patient_1,
+            doctor=self.doctor_1,
+            scheduled_start=datetime(2026, 11, 3, 10, 0, 0, tzinfo=dt_timezone.utc),
+            scheduled_end=datetime(2026, 11, 3, 11, 0, 0, tzinfo=dt_timezone.utc),
+            status='pending',
+            reason='Initial booking',
+        )
+        initial_updated_at = appt.updated_at
+
+        self.client.force_authenticate(user=self.patient_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. Valid partial update to scheduled_start: 09:30:00 (inside window)
+            res1 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_start': '2026-11-03T09:30:00Z'},
+                format='json',
+            )
+            self.assertEqual(res1.status_code, status.HTTP_200_OK)
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, datetime(2026, 11, 3, 9, 30, 0, tzinfo=dt_timezone.utc))
+
+            # 2. Invalid partial update to scheduled_start: 08:30:00 (before window start 09:00)
+            res2 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_start': '2026-11-03T08:30:00Z'},
+                format='json',
+            )
+            self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res2))
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_start, datetime(2026, 11, 3, 9, 30, 0, tzinfo=dt_timezone.utc))
+
+            # 3. Invalid partial update to scheduled_end: 12:30:00 (after window end 12:00)
+            res3 = self.client.patch(
+                self.detail_url(appt.id),
+                {'scheduled_end': '2026-11-03T12:30:00Z'},
+                format='json',
+            )
+            self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res3))
+            appt.refresh_from_db()
+            self.assertEqual(appt.scheduled_end, datetime(2026, 11, 3, 11, 0, 0, tzinfo=dt_timezone.utc))
+
+    def test_unchanged_historical_and_unrelated_updates_do_not_revalidate(self):
+        """Unrelated updates and unchanged timestamps on existing appointments do not revalidate availability."""
+        # Historical appointment in past
+        past_start = datetime(2026, 9, 2, 10, 0, 0, tzinfo=dt_timezone.utc)
+        past_end = datetime(2026, 9, 2, 11, 0, 0, tzinfo=dt_timezone.utc)
+        hist_appt = Appointment.objects.create(
+            patient=self.patient_1,
+            doctor=self.doctor_1,
+            scheduled_start=past_start,
+            scheduled_end=past_end,
+            status='completed',
+            notes='Initial clinical notes',
+            reason='Historical visit',
+        )
+
+        # Ensure NO doctor availability exists in DB at all
+        self.assertEqual(DoctorAvailability.objects.count(), 0)
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. PATCH unrelated field 'notes'
+            res_patch = self.client.patch(
+                self.detail_url(hist_appt.id),
+                {'notes': 'Updated addendum with no availability records'},
+                format='json',
+            )
+            self.assertEqual(res_patch.status_code, status.HTTP_200_OK)
+            hist_appt.refresh_from_db()
+            self.assertEqual(hist_appt.notes, 'Updated addendum with no availability records')
+            self.assertEqual(hist_appt.scheduled_start, past_start)
+
+            # 2. PUT with unchanged historical timestamps
+            res_put = self.client.put(
+                self.detail_url(hist_appt.id),
+                {
+                    'patient': str(self.patient_1.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': past_start.isoformat(),
+                    'scheduled_end': past_end.isoformat(),
+                    'notes': 'Final note with no availability records',
+                    'reason': 'Historical visit',
+                },
+                format='json',
+            )
+            self.assertEqual(res_put.status_code, status.HTTP_200_OK)
+            hist_appt.refresh_from_db()
+            self.assertEqual(hist_appt.notes, 'Final note with no availability records')
+
+            # 3. PUT with offset-equivalent timestamp (+05:30)
+            offset_start = '2026-09-02T15:30:00+05:30'  # 10:00 UTC
+            offset_end = '2026-09-02T16:30:00+05:30'    # 11:00 UTC
+            res_offset = self.client.put(
+                self.detail_url(hist_appt.id),
+                {
+                    'patient': str(self.patient_1.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': offset_start,
+                    'scheduled_end': offset_end,
+                    'notes': 'Offset note with no availability records',
+                    'reason': 'Historical visit',
+                },
+                format='json',
+            )
+            self.assertEqual(res_offset.status_code, status.HTTP_200_OK)
+            hist_appt.refresh_from_db()
+            self.assertEqual(hist_appt.notes, 'Offset note with no availability records')
+            self.assertEqual(hist_appt.scheduled_start, past_start)
+
+    def test_availability_validation_applies_identically_to_patient_doctor_admin(self):
+        """Patients, doctors, and admins are all subject to doctor availability validation."""
+        # Ensure doctor_1 has NO availability on Sunday Nov 8, 2026
+        target_start = '2026-11-08T14:00:00Z'
+        target_end = '2026-11-08T15:00:00Z'
+        initial_count = Appointment.objects.count()
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            # 1. Patient attempt
+            self.client.force_authenticate(user=self.patient_1)
+            res_patient = self.client.post(
+                self.list_url,
+                {
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': target_start,
+                    'scheduled_end': target_end,
+                    'reason': 'Patient booking without availability',
+                },
+                format='json',
+            )
+            self.assertEqual(res_patient.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_patient))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+            # 2. Doctor attempt
+            self.client.force_authenticate(user=self.doctor_1)
+            res_doctor = self.client.post(
+                self.list_url,
+                {
+                    'patient': str(self.patient_1.id),
+                    'scheduled_start': target_start,
+                    'scheduled_end': target_end,
+                    'reason': 'Doctor booking without availability',
+                },
+                format='json',
+            )
+            self.assertEqual(res_doctor.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_doctor))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
+            # 3. Admin attempt
+            self.client.force_authenticate(user=self.admin)
+            res_admin = self.client.post(
+                self.list_url,
+                {
+                    'patient': str(self.patient_1.id),
+                    'doctor': str(self.doctor_1.id),
+                    'scheduled_start': target_start,
+                    'scheduled_end': target_end,
+                    'reason': 'Admin booking without availability',
+                },
+                format='json',
+            )
+            self.assertEqual(res_admin.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertIn('scheduled_start', self.get_error_details(res_admin))
+            self.assertEqual(Appointment.objects.count(), initial_count)
+
 
 
 
