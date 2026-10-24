@@ -317,6 +317,181 @@ class UserProfileAccessControlTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
     # -------------------------------------------------------------------------
+    # Missing Related Rows Atomicity Regression Tests
+    # -------------------------------------------------------------------------
+
+    def test_missing_user_profile_and_medical_info_invalid_request_creates_no_rows(self):
+        """
+        When a user has no UserProfile or PatientMedicalInfo rows,
+        an invalid nested request must return 400 and NOT create either row.
+        """
+        raw_patient = User.objects.create_user(
+            email='raw_patient@example.com',
+            password='Password123!@#',
+            role='patient'
+        )
+        self.client.force_authenticate(user=raw_patient)
+        payload = {
+            'profile': {
+                'first_name': 'ValidFirst'
+            },
+            'medical_info': {
+                'blood_group': 'INVALID_CHOICE'
+            }
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            UserProfile.objects.filter(user=raw_patient).exists(),
+            "UserProfile row must not be persisted on invalid request"
+        )
+        self.assertFalse(
+            PatientMedicalInfo.objects.filter(user=raw_patient).exists(),
+            "PatientMedicalInfo row must not be persisted on invalid request"
+        )
+
+    def test_missing_user_profile_and_medical_info_valid_request_creates_rows(self):
+        """
+        When a user has no UserProfile or PatientMedicalInfo rows,
+        a valid nested request must atomically create both rows.
+        """
+        raw_patient = User.objects.create_user(
+            email='raw_patient_valid@example.com',
+            password='Password123!@#',
+            role='patient'
+        )
+        self.client.force_authenticate(user=raw_patient)
+        payload = {
+            'profile': {
+                'first_name': 'CreatedFirst',
+                'last_name': 'CreatedLast',
+                'phone': '+15550001122'
+            },
+            'medical_info': {
+                'blood_group': 'B+',
+                'allergies': ['Latex']
+            }
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(UserProfile.objects.filter(user=raw_patient).exists())
+        self.assertTrue(PatientMedicalInfo.objects.filter(user=raw_patient).exists())
+
+        profile = UserProfile.objects.get(user=raw_patient)
+        medical = PatientMedicalInfo.objects.get(user=raw_patient)
+        self.assertEqual(profile.first_name, 'CreatedFirst')
+        self.assertEqual(profile.last_name, 'CreatedLast')
+        self.assertEqual(medical.blood_group, 'B+')
+        self.assertEqual(medical.allergies, ['Latex'])
+
+    def test_missing_doctor_profile_invalid_request_creates_no_rows_and_avoids_unvalidated_defaults(self):
+        """
+        When a doctor has no DoctorProfile, an invalid request must return 400
+        without creating a DoctorProfile row or persisting unvalidated defaults.
+        """
+        raw_doctor = User.objects.create_user(
+            email='raw_doctor@example.com',
+            password='Password123!@#',
+            role='doctor'
+        )
+        self.client.force_authenticate(user=raw_doctor)
+        payload = {
+            'doctor_profile': {
+                'specialization': 'UnvalidatedSpecialization',
+                'years_of_experience': -99
+            }
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(
+            DoctorProfile.objects.filter(user=raw_doctor).exists(),
+            "DoctorProfile row must not be persisted when validation fails"
+        )
+        self.assertFalse(
+            DoctorProfile.objects.filter(specialization='UnvalidatedSpecialization').exists(),
+            "Unvalidated doctor specialization must not be persisted in database"
+        )
+
+    def test_missing_doctor_profile_valid_request_creates_row(self):
+        """
+        When a doctor has no DoctorProfile, a valid request must atomically create the row.
+        """
+        raw_doctor = User.objects.create_user(
+            email='raw_doctor_valid@example.com',
+            password='Password123!@#',
+            role='doctor'
+        )
+        self.client.force_authenticate(user=raw_doctor)
+        payload = {
+            'doctor_profile': {
+                'specialization': 'Neurology',
+                'years_of_experience': 12,
+                'consultation_fee': '250.00'
+            }
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertTrue(DoctorProfile.objects.filter(user=raw_doctor).exists())
+        doc_profile = DoctorProfile.objects.get(user=raw_doctor)
+        self.assertEqual(doc_profile.specialization, 'Neurology')
+        self.assertEqual(doc_profile.years_of_experience, 12)
+        self.assertEqual(float(doc_profile.consultation_fee), 250.00)
+
+    def test_existing_profile_with_missing_medical_info_invalid_request_leaves_existing_unmodified(self):
+        """
+        If a user has an existing UserProfile but no PatientMedicalInfo,
+        an invalid request must not modify the existing UserProfile and must not create PatientMedicalInfo.
+        """
+        partial_patient = User.objects.create_user(
+            email='partial_patient@example.com',
+            password='Password123!@#',
+            role='patient'
+        )
+        profile = UserProfile.objects.create(
+            user=partial_patient,
+            first_name='ExistingFirst',
+            last_name='ExistingLast'
+        )
+        self.client.force_authenticate(user=partial_patient)
+        payload = {
+            'profile': {
+                'first_name': 'ShouldNotChange'
+            },
+            'medical_info': {
+                'blood_group': 'INVALID_CHOICE'
+            }
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        profile.refresh_from_db()
+        self.assertEqual(profile.first_name, 'ExistingFirst')
+        self.assertFalse(PatientMedicalInfo.objects.filter(user=partial_patient).exists())
+
+    def test_missing_user_profile_invalid_type_creates_no_row(self):
+        """
+        When a user has no UserProfile, sending an invalid type for profile must return 400
+        and not create a UserProfile.
+        """
+        raw_patient = User.objects.create_user(
+            email='raw_patient_bad_type@example.com',
+            password='Password123!@#',
+            role='patient'
+        )
+        self.client.force_authenticate(user=raw_patient)
+        payload = {
+            'profile': 'string-not-dict'
+        }
+        response = self.client.patch(self.profile_url, payload, format='json')
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(UserProfile.objects.filter(user=raw_patient).exists())
+
+    # -------------------------------------------------------------------------
     # Role Boundary Protection
     # -------------------------------------------------------------------------
 

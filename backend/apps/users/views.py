@@ -228,10 +228,9 @@ class UserProfileView(generics.RetrieveAPIView):
             if not isinstance(profile_data, dict):
                 errors['profile'] = {'detail': 'Expected a dictionary of profile fields.'}
             else:
-                profile, _ = UserProfile.objects.get_or_create(
-                    user=user,
-                    defaults={'first_name': '', 'last_name': ''}
-                )
+                profile = UserProfile.objects.filter(user=user).first()
+                if profile is None:
+                    profile = UserProfile(user=user, first_name='', last_name='')
                 profile_serializer = UpdateProfileSerializer(
                     profile,
                     data=profile_data,
@@ -248,13 +247,13 @@ class UserProfileView(generics.RetrieveAPIView):
             if not isinstance(doctor_data, dict):
                 errors['doctor_profile'] = {'detail': 'Expected a dictionary of doctor profile fields.'}
             else:
-                doctor_profile, _ = DoctorProfile.objects.get_or_create(
-                    user=user,
-                    defaults={
-                        'specialization': doctor_data.get('specialization', 'General Medicine'),
-                        'license_number': doctor_data.get('license_number', f'PENDING-{user.id}'),
-                    }
-                )
+                doctor_profile = DoctorProfile.objects.filter(user=user).first()
+                if doctor_profile is None:
+                    doctor_profile = DoctorProfile(
+                        user=user,
+                        specialization='General Medicine',
+                        license_number=f'PENDING-{user.id}'
+                    )
                 doctor_profile_serializer = UpdateDoctorProfileSerializer(
                     doctor_profile,
                     data=doctor_data,
@@ -271,7 +270,9 @@ class UserProfileView(generics.RetrieveAPIView):
             if not isinstance(medical_data, dict):
                 errors['medical_info'] = {'detail': 'Expected a dictionary of medical info fields.'}
             else:
-                medical_info, _ = PatientMedicalInfo.objects.get_or_create(user=user)
+                medical_info = PatientMedicalInfo.objects.filter(user=user).first()
+                if medical_info is None:
+                    medical_info = PatientMedicalInfo(user=user)
                 medical_info_serializer = UpdateMedicalInfoSerializer(
                     medical_info,
                     data=medical_data,
