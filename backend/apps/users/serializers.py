@@ -63,7 +63,9 @@ class UserSerializer(serializers.ModelSerializer):
             'id', 'email', 'role', 'is_active', 'is_verified',
             'created_at', 'profile', 'doctor_profile', 'medical_info'
         ]
-        read_only_fields = ['id', 'created_at', 'is_verified']
+        read_only_fields = [
+            'id', 'email', 'role', 'is_active', 'is_verified', 'created_at'
+        ]
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -97,12 +99,17 @@ class RegisterSerializer(serializers.ModelSerializer):
         ]
     
     def validate(self, attrs):
-        """Validate password confirmation."""
+        """Validate password confirmation and role requirements."""
         if attrs['password'] != attrs['password_confirm']:
             raise serializers.ValidationError({
                 "password": "Password fields didn't match."
             })
-        if attrs.get('role') == 'doctor':
+        role = attrs.get('role', 'patient')
+        if isinstance(role, str) and role.strip().lower() == 'admin':
+            raise serializers.ValidationError({
+                "role": "Registration with 'admin' role is not permitted."
+            })
+        if role == 'doctor':
             required = ['specialization', 'license_number']
             missing = [field for field in required if not attrs.get(field)]
             if missing:
@@ -113,12 +120,19 @@ class RegisterSerializer(serializers.ModelSerializer):
         return attrs
     
     def validate_role(self, value):
-        """Validate role - only patients can self-register."""
-        if value not in ['patient', 'doctor']:
+        """Validate role - only patients and doctors can self-register; reject admin."""
+        if not value:
+            return 'patient'
+        clean_value = str(value).strip().lower()
+        if clean_value == 'admin':
+            raise serializers.ValidationError(
+                "Registration with 'admin' role is not permitted."
+            )
+        if clean_value not in ['patient', 'doctor']:
             raise serializers.ValidationError(
                 "Invalid role. Only 'patient' or 'doctor' allowed for registration."
             )
-        return value
+        return clean_value
     
     def create(self, validated_data):
         """Create user with profile."""

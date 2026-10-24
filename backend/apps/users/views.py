@@ -1,7 +1,7 @@
 """
 Views for User app - Authentication and User Management.
 """
-from rest_framework import status, generics, viewsets
+from rest_framework import status, generics, viewsets, exceptions, serializers
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -169,15 +169,39 @@ class ChangePasswordView(generics.UpdateAPIView):
         }, status=status.HTTP_200_OK)
 
 
-class UserProfileView(generics.RetrieveUpdateAPIView):
+class UserProfileView(generics.RetrieveAPIView):
     """
     Get and update user profile.
+
+    GET: Retrieve authenticated user's profile representation.
+    PATCH: Partially update nested profile, doctor_profile, or medical_info models.
+    PUT: Unsupported (returns 405 Method Not Allowed).
     """
     permission_classes = [IsAuthenticated]
     serializer_class = UserSerializer
+    http_method_names = ['get', 'patch', 'head', 'options']
     
     def get_object(self):
         return self.request.user
+    
+    def http_method_not_allowed(self, request, *args, **kwargs):
+        """Return 405 Method Not Allowed with explicit explanation when PUT is called."""
+        if request.method == 'PUT':
+            raise exceptions.MethodNotAllowed(
+                request.method,
+                detail='Method "PUT" not allowed. Use PATCH for profile updates.'
+            )
+        return super().http_method_not_allowed(request, *args, **kwargs)
+    
+    def put(self, request, *args, **kwargs):
+        """
+        PUT is unsupported for profile updates.
+        Clients must use PATCH for partial profile updates.
+        """
+        return Response(
+            {'detail': 'Method "PUT" not allowed. Use PATCH for profile updates.'},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED
+        )
     
     @extend_schema(
         summary="Get current user profile",
@@ -189,55 +213,86 @@ class UserProfileView(generics.RetrieveUpdateAPIView):
     
     @extend_schema(
         summary="Update current user profile",
-        description="Update authenticated user's profile",
+        description="Update authenticated user's profile using PATCH (PUT is unsupported and returns 405)",
         tags=["User Management"]
     )
     def patch(self, request, *args, **kwargs):
         user = self.get_object()
         
-        # Update user profile
+        errors = {}
+        serializers_to_save = []
+        
+        # 1. Update user profile (available to all users)
         if 'profile' in request.data:
-            profile, _ = UserProfile.objects.get_or_create(
-                user=user,
-                defaults={'first_name': '', 'last_name': ''}
-            )
-            profile_serializer = UpdateProfileSerializer(
-                profile,
-                data=request.data['profile'],
-                partial=True
-            )
-            if profile_serializer.is_valid(raise_exception=True):
-                profile_serializer.save()
+            profile_data = request.data['profile']
+            if not isinstance(profile_data, dict):
+                errors['profile'] = {'detail': 'Expected a dictionary of profile fields.'}
+            else:
+                profile, _ = UserProfile.objects.get_or_create(
+                    user=user,
+                    defaults={'first_name': '', 'last_name': ''}
+                )
+                profile_serializer = UpdateProfileSerializer(
+                    profile,
+                    data=profile_data,
+                    partial=True
+                )
+                if not profile_serializer.is_valid():
+                    errors['profile'] = profile_serializer.errors
+                else:
+                    serializers_to_save.append(profile_serializer)
         
-        # Update doctor profile if doctor
+        # 2. Update doctor profile (doctor only)
         if user.is_doctor and 'doctor_profile' in request.data:
-            doctor_profile, _ = DoctorProfile.objects.get_or_create(
-                user=user,
-                defaults={
-                    'specialization': request.data['doctor_profile'].get('specialization', 'General Medicine'),
-                    'license_number': request.data['doctor_profile'].get('license_number', f'PENDING-{user.id}'),
-                }
-            )
-            doctor_profile_serializer = UpdateDoctorProfileSerializer(
-                doctor_profile,
-                data=request.data['doctor_profile'],
-                partial=True
-            )
-            if doctor_profile_serializer.is_valid(raise_exception=True):
-                doctor_profile_serializer.save()
+            doctor_data = request.data['doctor_profile']
+            if not isinstance(doctor_data, dict):
+                errors['doctor_profile'] = {'detail': 'Expected a dictionary of doctor profile fields.'}
+            else:
+                doctor_profile, _ = DoctorProfile.objects.get_or_create(
+                    user=user,
+                    defaults={
+                        'specialization': doctor_data.get('specialization', 'General Medicine'),
+                        'license_number': doctor_data.get('license_number', f'PENDING-{user.id}'),
+                    }
+                )
+                doctor_profile_serializer = UpdateDoctorProfileSerializer(
+                    doctor_profile,
+                    data=doctor_data,
+                    partial=True
+                )
+                if not doctor_profile_serializer.is_valid():
+                    errors['doctor_profile'] = doctor_profile_serializer.errors
+                else:
+                    serializers_to_save.append(doctor_profile_serializer)
         
-        # Update medical info if patient
+        # 3. Update medical info (patient only)
         if user.is_patient and 'medical_info' in request.data:
-            medical_info, _ = PatientMedicalInfo.objects.get_or_create(user=user)
-            medical_info_serializer = UpdateMedicalInfoSerializer(
-                medical_info,
-                data=request.data['medical_info'],
-                partial=True
-            )
-            if medical_info_serializer.is_valid(raise_exception=True):
-                medical_info_serializer.save()
+            medical_data = request.data['medical_info']
+            if not isinstance(medical_data, dict):
+                errors['medical_info'] = {'detail': 'Expected a dictionary of medical info fields.'}
+            else:
+                medical_info, _ = PatientMedicalInfo.objects.get_or_create(user=user)
+                medical_info_serializer = UpdateMedicalInfoSerializer(
+                    medical_info,
+                    data=medical_data,
+                    partial=True
+                )
+                if not medical_info_serializer.is_valid():
+                    errors['medical_info'] = medical_info_serializer.errors
+                else:
+                    serializers_to_save.append(medical_info_serializer)
         
-        return Response(UserSerializer(user).data)
+        # Abort before saving anything if any nested serializer failed validation
+        if errors:
+            raise serializers.ValidationError(errors)
+        
+        # Atomically commit all valid updates
+        with transaction.atomic():
+            for serializer in serializers_to_save:
+                serializer.save()
+        
+        user.refresh_from_db()
+        return Response(UserSerializer(user).data, status=status.HTTP_200_OK)
 
 
 class DoctorViewSet(viewsets.ReadOnlyModelViewSet):

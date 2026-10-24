@@ -23,6 +23,8 @@ Create a new user account (patient or doctor).
 
 **Permission:** Public (AllowAny)
 
+> **Role Restriction:** Only `patient` or `doctor` roles can be registered through this endpoint. The `admin` role is strictly rejected. Privileged account flags (`is_staff`, `is_superuser`, `is_verified`) cannot be set during registration.
+
 **Request Body:**
 ```json
 {
@@ -203,6 +205,8 @@ Update authenticated user's profile.
 **Endpoint:** `PATCH /auth/profile/`
 
 **Permission:** Authenticated
+
+> **Method Restriction:** `PUT /auth/profile/` is unsupported and returns `405 Method Not Allowed`. Profile writes must use `PATCH` for partial updates of nested resources (`profile`, `doctor_profile`, `medical_info`). Account security fields (`role`, `is_active`, `is_staff`, `is_superuser`, `is_verified`, and `email`) are strictly read-only and cannot be altered via profile writes. All nested updates are validated before saving; invalid nested input triggers atomic rollback without partial modification.
 
 **Request Body:**
 ```json
