@@ -8,6 +8,8 @@ describe('Realtime Auth Middleware & JWT Resolution', () => {
 
   beforeEach(() => {
     process.env = { ...origEnv };
+    delete process.env.JWT_SECRET_KEY;
+    delete process.env.DJANGO_SECRET_KEY;
   });
 
   describe('getJwtSecret() resolution policy', () => {
