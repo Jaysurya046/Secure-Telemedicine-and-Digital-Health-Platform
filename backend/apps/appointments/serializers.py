@@ -167,3 +167,73 @@ class DoctorAvailabilitySerializer(serializers.ModelSerializer):
         if start_time and end_time and end_time <= start_time:
             raise serializers.ValidationError({'end_time': 'End time must be after start time.'})
         return attrs
+
+
+class AppointmentConfirmSerializer(serializers.Serializer):
+    """
+    Supporting serializer for confirming appointments.
+    Accepts only empty objects or genuinely bodyless requests.
+    Rejects unknown fields and non-object JSON, including explicit null and "".
+    """
+
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            raise serializers.ValidationError({'non_field_errors': ['Expected an object or empty body.']})
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if not isinstance(self.initial_data, Mapping):
+            raise serializers.ValidationError({'non_field_errors': ['Expected an object or empty body.']})
+        extra_fields = set(self.initial_data.keys())
+        if extra_fields:
+            raise serializers.ValidationError({
+                field: f"Unexpected field '{field}'. This action accepts no parameters."
+                for field in sorted(extra_fields)
+            })
+        return attrs
+
+
+class AppointmentCompleteSerializer(AppointmentConfirmSerializer):
+    """
+    Supporting serializer for completing appointments.
+    Accepts only empty objects or genuinely bodyless requests.
+    Rejects unknown fields and non-object JSON, including explicit null and "".
+    """
+    pass
+
+
+class AppointmentCancelSerializer(serializers.Serializer):
+    """
+    Supporting serializer for cancelling appointments.
+    Accepts only an optional cancellation_reason string; allow blank, reject null and structured values.
+    Reject unknown fields and non-object JSON, including explicit null and "".
+    """
+    ALLOWED_FIELDS = {'cancellation_reason'}
+
+    cancellation_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        allow_null=False,
+    )
+
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            raise serializers.ValidationError({'non_field_errors': ['Expected an object.']})
+        if 'cancellation_reason' in data:
+            raw = data['cancellation_reason']
+            if raw is None:
+                raise serializers.ValidationError({'cancellation_reason': ['This field may not be null.']})
+            if not isinstance(raw, str):
+                raise serializers.ValidationError({'cancellation_reason': ['Must be a string; structured values are rejected.']})
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if not isinstance(self.initial_data, Mapping):
+            raise serializers.ValidationError({'non_field_errors': ['Expected an object.']})
+        extra_fields = set(self.initial_data.keys()) - self.ALLOWED_FIELDS
+        if extra_fields:
+            raise serializers.ValidationError({
+                field: f"Unexpected field '{field}'."
+                for field in sorted(extra_fields)
+            })
+        return attrs

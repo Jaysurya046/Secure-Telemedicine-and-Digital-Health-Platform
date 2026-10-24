@@ -993,3 +993,505 @@ class MalformedBodiesAndTimeConflictTests(BaseAppointmentTestCase):
         response = self.client.post(self.list_url, payload, format='json')
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertEqual(Appointment.objects.count(), initial_count)
+
+
+class AppointmentLifecycleActionValidationTests(BaseAppointmentTestCase):
+    """
+    Feature 4B: Validate appointment lifecycle actions (confirm, cancel, complete).
+
+    Requirements:
+    - confirm: only pending -> confirmed.
+    - cancel: only pending or confirmed -> cancelled.
+    - complete: only confirmed -> completed.
+    - Invalid or repeated transitions return HTTP 409 without changing stored fields, including updated_at.
+    - Preserve current role restrictions and participant-scoped access.
+    - Validate payloads before writes:
+        - confirm/complete accept only empty objects or genuinely bodyless requests.
+        - cancel accepts only an optional cancellation_reason string; allow blank, reject null and structured values.
+        - Reject unknown fields and non-object JSON, including explicit null and "", with HTTP 400.
+    - Perform each transition inside transaction.atomic(), locking with select_for_update() and checking status under lock.
+    - Preserve unrelated fields.
+    """
+
+    # =========================================================================
+    # 1. Transition Matrix: confirm (only pending -> confirmed)
+    # =========================================================================
+
+    def test_confirm_valid_transition_pending_to_confirmed(self):
+        """confirm permits pending -> confirmed."""
+        self.client.force_authenticate(user=self.doctor_1)
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+        res = self.client.post(self.confirm_url(self.appointment_1.id))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'confirmed')
+        self.assertEqual(res.data['status'], 'confirmed')
+
+    def test_confirm_repeated_and_invalid_transitions_return_409_without_mutation(self):
+        """confirm rejects confirmed (repeated), cancelled, completed, and no_show with 409 without modifying state."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        invalid_statuses = ['confirmed', 'cancelled', 'completed', 'no_show']
+        for invalid_status in invalid_statuses:
+            with self.subTest(status=invalid_status):
+                self.appointment_1.status = invalid_status
+                self.appointment_1.notes = f'Notes before confirm on {invalid_status}'
+                self.appointment_1.save()
+                self.appointment_1.refresh_from_db()
+                initial_updated_at = self.appointment_1.updated_at
+
+                res = self.client.post(self.confirm_url(self.appointment_1.id))
+                self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+                self.assertIn('Cannot confirm appointment', str(res.data))
+
+                self.appointment_1.refresh_from_db()
+                self.assertEqual(self.appointment_1.status, invalid_status)
+                self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+                self.assertEqual(self.appointment_1.notes, f'Notes before confirm on {invalid_status}')
+
+    # =========================================================================
+    # 2. Transition Matrix: cancel (only pending or confirmed -> cancelled)
+    # =========================================================================
+
+    def test_cancel_valid_transition_from_pending(self):
+        """cancel permits pending -> cancelled."""
+        self.client.force_authenticate(user=self.patient_1)
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+        res = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            {'cancellation_reason': 'Patient schedule conflict'},
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Patient schedule conflict')
+        self.assertEqual(res.data['status'], 'cancelled')
+
+    def test_cancel_valid_transition_from_confirmed(self):
+        """cancel permits confirmed -> cancelled."""
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save()
+
+        self.client.force_authenticate(user=self.doctor_1)
+        res = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            {'cancellation_reason': 'Doctor emergency'},
+            format='json',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Doctor emergency')
+
+    def test_cancel_repeated_and_invalid_transitions_return_409_without_mutation(self):
+        """cancel rejects cancelled (repeated), completed, and no_show with 409 without modifying state."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        invalid_statuses = ['cancelled', 'completed', 'no_show']
+        for invalid_status in invalid_statuses:
+            with self.subTest(status=invalid_status):
+                self.appointment_1.status = invalid_status
+                self.appointment_1.cancellation_reason = 'Original reason'
+                self.appointment_1.save()
+                self.appointment_1.refresh_from_db()
+                initial_updated_at = self.appointment_1.updated_at
+
+                res = self.client.post(
+                    self.cancel_url(self.appointment_1.id),
+                    {'cancellation_reason': 'New reason should be rejected'},
+                    format='json',
+                )
+                self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+                self.assertIn('Cannot cancel appointment', str(res.data))
+
+                self.appointment_1.refresh_from_db()
+                self.assertEqual(self.appointment_1.status, invalid_status)
+                self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+                self.assertEqual(self.appointment_1.cancellation_reason, 'Original reason')
+
+    # =========================================================================
+    # 3. Transition Matrix: complete (only confirmed -> completed)
+    # =========================================================================
+
+    def test_complete_valid_transition_from_confirmed(self):
+        """complete permits confirmed -> completed."""
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save()
+
+        self.client.force_authenticate(user=self.doctor_1)
+        res = self.client.post(self.complete_url(self.appointment_1.id))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'completed')
+        self.assertEqual(res.data['status'], 'completed')
+
+    def test_complete_repeated_and_invalid_transitions_return_409_without_mutation(self):
+        """complete rejects pending, completed (repeated), cancelled, and no_show with 409 without modifying state."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        invalid_statuses = ['pending', 'completed', 'cancelled', 'no_show']
+        for invalid_status in invalid_statuses:
+            with self.subTest(status=invalid_status):
+                self.appointment_1.status = invalid_status
+                self.appointment_1.notes = f'Notes before complete on {invalid_status}'
+                self.appointment_1.save()
+                self.appointment_1.refresh_from_db()
+                initial_updated_at = self.appointment_1.updated_at
+
+                res = self.client.post(self.complete_url(self.appointment_1.id))
+                self.assertEqual(res.status_code, status.HTTP_409_CONFLICT)
+                self.assertIn('Cannot complete appointment', str(res.data))
+
+                self.appointment_1.refresh_from_db()
+                self.assertEqual(self.appointment_1.status, invalid_status)
+                self.assertEqual(self.appointment_1.updated_at, initial_updated_at)
+                self.assertEqual(self.appointment_1.notes, f'Notes before complete on {invalid_status}')
+
+    # =========================================================================
+    # 4. Payload Validation: confirm and complete
+    # =========================================================================
+
+    def test_confirm_and_complete_accept_empty_object_and_bodyless(self):
+        """confirm and complete accept empty object and bodyless requests."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # Bodyless confirm
+        res1 = self.client.post(self.confirm_url(self.appointment_1.id))
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'confirmed')
+
+        # Empty object complete
+        res2 = self.client.post(self.complete_url(self.appointment_1.id), data={}, format='json')
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'completed')
+
+    def test_confirm_and_complete_reject_unexpected_fields(self):
+        """confirm and complete reject unexpected fields with 400 Bad Request."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # confirm with extra field
+        res1 = self.client.post(
+            self.confirm_url(self.appointment_1.id),
+            data={'unexpected_field': 'value'},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+        # Prepare confirmed appointment for complete test
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save()
+
+        # complete with extra field
+        res2 = self.client.post(
+            self.complete_url(self.appointment_1.id),
+            data={'cancellation_reason': 'not allowed here'},
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'confirmed')
+
+    def test_confirm_and_complete_reject_non_object_json(self):
+        """confirm and complete reject explicit null, empty string, list, and primitives with 400."""
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. confirm with explicit 'null'
+        res1 = self.client.post(
+            self.confirm_url(self.appointment_1.id),
+            data='null',
+            content_type='application/json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 2. confirm with explicit '""'
+        res2 = self.client.post(
+            self.confirm_url(self.appointment_1.id),
+            data='""',
+            content_type='application/json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. confirm with array '[]'
+        res3 = self.client.post(
+            self.confirm_url(self.appointment_1.id),
+            data='[]',
+            content_type='application/json',
+        )
+        self.assertEqual(res3.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 4. confirm with number '123'
+        res4 = self.client.post(
+            self.confirm_url(self.appointment_1.id),
+            data='123',
+            content_type='application/json',
+        )
+        self.assertEqual(res4.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+        # Test same on complete
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save()
+
+        res5 = self.client.post(
+            self.complete_url(self.appointment_1.id),
+            data='null',
+            content_type='application/json',
+        )
+        self.assertEqual(res5.status_code, status.HTTP_400_BAD_REQUEST)
+
+        res6 = self.client.post(
+            self.complete_url(self.appointment_1.id),
+            data='""',
+            content_type='application/json',
+        )
+        self.assertEqual(res6.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'confirmed')
+
+    # =========================================================================
+    # 5. Payload Validation: cancel
+    # =========================================================================
+
+    def test_cancel_accepts_valid_string_and_blank_and_omitted(self):
+        """cancel accepts optional cancellation_reason string, blank string, and omitted reason."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        # 1. Blank string
+        res1 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': ''},
+            format='json',
+        )
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, '')
+
+        # Reset appointment
+        self.appointment_1.status = 'pending'
+        self.appointment_1.save()
+
+        # 2. Omitted / empty object
+        res2 = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={},
+            format='json',
+        )
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+
+        # Reset appointment
+        self.appointment_1.status = 'pending'
+        self.appointment_1.save()
+
+        # 3. Bodyless request
+        res3 = self.client.post(self.cancel_url(self.appointment_1.id))
+        self.assertEqual(res3.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+
+    def test_cancel_accepts_multipart_form_data(self):
+        """cancel accepts multipart/form-data with or without cancellation_reason."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        res = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': 'Multipart cancelled reason'},
+            format='multipart',
+        )
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'cancelled')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Multipart cancelled reason')
+
+    def test_cancel_rejects_explicit_null_and_structured_values(self):
+        """cancel rejects null, list, dict, bool, and numeric cancellation_reason with 400."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        invalid_reasons = [
+            None,
+            ['array', 'of', 'reasons'],
+            {'reason': 'nested object'},
+            12345,
+            True,
+            False,
+        ]
+
+        for invalid_reason in invalid_reasons:
+            with self.subTest(reason=invalid_reason):
+                res = self.client.post(
+                    self.cancel_url(self.appointment_1.id),
+                    data={'cancellation_reason': invalid_reason},
+                    format='json',
+                )
+                self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn('cancellation_reason', self.get_error_details(res))
+                self.appointment_1.refresh_from_db()
+                self.assertEqual(self.appointment_1.status, 'pending')
+
+    def test_cancel_rejects_unknown_fields_and_non_object_json(self):
+        """cancel rejects unexpected fields, explicit 'null', '\"\"', and arrays with 400."""
+        self.client.force_authenticate(user=self.patient_1)
+
+        # 1. Unexpected extra field alongside cancellation_reason
+        res_extra = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'cancellation_reason': 'Valid reason', 'extra_field': 'not allowed'},
+            format='json',
+        )
+        self.assertEqual(res_extra.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 2. Only unexpected field
+        res_unknown = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data={'notes': 'some notes'},
+            format='json',
+        )
+        self.assertEqual(res_unknown.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 3. Explicit 'null' JSON
+        res_null = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data='null',
+            content_type='application/json',
+        )
+        self.assertEqual(res_null.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 4. Explicit '""' JSON
+        res_empty_str = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data='""',
+            content_type='application/json',
+        )
+        self.assertEqual(res_empty_str.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # 5. Array JSON
+        res_arr = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            data='[]',
+            content_type='application/json',
+        )
+        self.assertEqual(res_arr.status_code, status.HTTP_400_BAD_REQUEST)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.status, 'pending')
+
+    # =========================================================================
+    # 6. Preserved Role Restrictions & Participant-Scoped Access
+    # =========================================================================
+
+    def test_confirm_action_role_restrictions(self):
+        """confirm is restricted to assigned doctor and admin; patient, unassigned doctor, and nurse denied."""
+        # Patient cannot confirm (403)
+        self.client.force_authenticate(user=self.patient_1)
+        self.assertEqual(self.client.post(self.confirm_url(self.appointment_1.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+        # Unassigned Doctor 2 receives 404 (participant scoping)
+        self.client.force_authenticate(user=self.doctor_2)
+        self.assertEqual(self.client.post(self.confirm_url(self.appointment_1.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Nurse receives 403
+        self.client.force_authenticate(user=self.nurse)
+        self.assertEqual(self.client.post(self.confirm_url(self.appointment_1.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+        # Unauthenticated receives 401
+        self.client.logout()
+        self.assertEqual(self.client.post(self.confirm_url(self.appointment_1.id)).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Admin can confirm any appointment (200)
+        self.client.force_authenticate(user=self.admin)
+        res_admin = self.client.post(self.confirm_url(self.appointment_1.id))
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+
+    def test_cancel_action_role_restrictions(self):
+        """cancel permits assigned patient, assigned doctor, and admin; unassigned participants receive 404."""
+        # Unassigned patient receives 404
+        self.client.force_authenticate(user=self.patient_2)
+        self.assertEqual(self.client.post(self.cancel_url(self.appointment_1.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Unassigned doctor receives 404
+        self.client.force_authenticate(user=self.doctor_2)
+        self.assertEqual(self.client.post(self.cancel_url(self.appointment_1.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Nurse receives 403
+        self.client.force_authenticate(user=self.nurse)
+        self.assertEqual(self.client.post(self.cancel_url(self.appointment_1.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+        # Assigned patient can cancel (200)
+        self.client.force_authenticate(user=self.patient_1)
+        res_pat = self.client.post(self.cancel_url(self.appointment_1.id))
+        self.assertEqual(res_pat.status_code, status.HTTP_200_OK)
+
+    def test_complete_action_role_restrictions(self):
+        """complete is restricted to assigned doctor and admin; patient and unassigned doctor denied."""
+        self.appointment_1.status = 'confirmed'
+        self.appointment_1.save()
+
+        # Patient cannot complete (403)
+        self.client.force_authenticate(user=self.patient_1)
+        self.assertEqual(self.client.post(self.complete_url(self.appointment_1.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+        # Unassigned doctor receives 404
+        self.client.force_authenticate(user=self.doctor_2)
+        self.assertEqual(self.client.post(self.complete_url(self.appointment_1.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Assigned doctor can complete (200)
+        self.client.force_authenticate(user=self.doctor_1)
+        res_doc = self.client.post(self.complete_url(self.appointment_1.id))
+        self.assertEqual(res_doc.status_code, status.HTTP_200_OK)
+
+    # =========================================================================
+    # 7. Preserve Unrelated Fields
+    # =========================================================================
+
+    def test_transitions_preserve_all_unrelated_fields(self):
+        """confirm, cancel, and complete preserve all unrelated fields on Appointment."""
+        self.appointment_1.reason = 'Preserved Reason'
+        self.appointment_1.notes = 'Preserved Notes'
+        self.appointment_1.symptoms = ['cough', 'fever']
+        self.appointment_1.meeting_link = 'https://telemed.example.com/rooms/test-room'
+        self.appointment_1.save()
+
+        # 1. confirm preserves fields
+        self.client.force_authenticate(user=self.doctor_1)
+        res_confirm = self.client.post(self.confirm_url(self.appointment_1.id))
+        self.assertEqual(res_confirm.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.reason, 'Preserved Reason')
+        self.assertEqual(self.appointment_1.notes, 'Preserved Notes')
+        self.assertEqual(self.appointment_1.symptoms, ['cough', 'fever'])
+        self.assertEqual(self.appointment_1.meeting_link, 'https://telemed.example.com/rooms/test-room')
+        self.assertEqual(self.appointment_1.patient, self.patient_1)
+        self.assertEqual(self.appointment_1.doctor, self.doctor_1)
+
+        # 2. cancel preserves fields
+        res_cancel = self.client.post(
+            self.cancel_url(self.appointment_1.id),
+            {'cancellation_reason': 'Patient emergency'},
+            format='json',
+        )
+        self.assertEqual(res_cancel.status_code, status.HTTP_200_OK)
+
+        self.appointment_1.refresh_from_db()
+        self.assertEqual(self.appointment_1.reason, 'Preserved Reason')
+        self.assertEqual(self.appointment_1.notes, 'Preserved Notes')
+        self.assertEqual(self.appointment_1.symptoms, ['cough', 'fever'])
+        self.assertEqual(self.appointment_1.meeting_link, 'https://telemed.example.com/rooms/test-room')
+        self.assertEqual(self.appointment_1.cancellation_reason, 'Patient emergency')
+

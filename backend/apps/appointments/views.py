@@ -3,12 +3,19 @@ from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
 
 from .models import Appointment, DoctorAvailability
 from .permissions import AppointmentAccessPermission
-from .serializers import AppointmentSerializer, DoctorAvailabilitySerializer
+from .serializers import (
+    AppointmentSerializer,
+    DoctorAvailabilitySerializer,
+    AppointmentConfirmSerializer,
+    AppointmentCompleteSerializer,
+    AppointmentCancelSerializer,
+)
 
 
 class AppointmentViewSet(viewsets.ModelViewSet):
@@ -50,26 +57,79 @@ class AppointmentViewSet(viewsets.ModelViewSet):
         appointment = self.get_object()
         if request.user.role not in ['doctor', 'admin']:
             return Response({'error': 'Only doctors or admins can confirm appointments.'}, status=status.HTTP_403_FORBIDDEN)
-        appointment.status = 'confirmed'
-        appointment.save(update_fields=['status', 'updated_at'])
-        return Response(self.get_serializer(appointment).data)
+        if request.user.role == 'doctor' and appointment.doctor_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor or an admin can confirm this appointment.'}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = AppointmentConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            locked = Appointment.objects.select_for_update().get(id=appointment.id)
+            if locked.status != 'pending':
+                return Response(
+                    {
+                        'error': True,
+                        'message': f"Cannot confirm appointment with status '{locked.status}'. Only 'pending' appointments can be confirmed.",
+                        'detail': f"Cannot confirm appointment with status '{locked.status}'. Only 'pending' appointments can be confirmed.",
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            locked.status = 'confirmed'
+            locked.save(update_fields=['status', 'updated_at'])
+            return Response(self.get_serializer(locked).data)
 
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
         appointment = self.get_object()
-        appointment.status = 'cancelled'
-        appointment.cancellation_reason = request.data.get('cancellation_reason', '')
-        appointment.save(update_fields=['status', 'cancellation_reason', 'updated_at'])
-        return Response(self.get_serializer(appointment).data)
+        if request.user.role == 'doctor' and appointment.doctor_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor, patient, or an admin can cancel this appointment.'}, status=status.HTTP_403_FORBIDDEN)
+        if request.user.role == 'patient' and appointment.patient_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor, patient, or an admin can cancel this appointment.'}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = AppointmentCancelSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            locked = Appointment.objects.select_for_update().get(id=appointment.id)
+            if locked.status not in ['pending', 'confirmed']:
+                return Response(
+                    {
+                        'error': True,
+                        'message': f"Cannot cancel appointment with status '{locked.status}'. Only 'pending' or 'confirmed' appointments can be cancelled.",
+                        'detail': f"Cannot cancel appointment with status '{locked.status}'. Only 'pending' or 'confirmed' appointments can be cancelled.",
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            locked.status = 'cancelled'
+            locked.cancellation_reason = serializer.validated_data.get('cancellation_reason', '')
+            locked.save(update_fields=['status', 'cancellation_reason', 'updated_at'])
+            return Response(self.get_serializer(locked).data)
 
     @action(detail=True, methods=['post'])
     def complete(self, request, pk=None):
         appointment = self.get_object()
         if request.user.role not in ['doctor', 'admin']:
             return Response({'error': 'Only doctors or admins can complete appointments.'}, status=status.HTTP_403_FORBIDDEN)
-        appointment.status = 'completed'
-        appointment.save(update_fields=['status', 'updated_at'])
-        return Response(self.get_serializer(appointment).data)
+        if request.user.role == 'doctor' and appointment.doctor_id != request.user.id:
+            return Response({'error': 'Only the assigned doctor or an admin can complete this appointment.'}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = AppointmentCompleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        with transaction.atomic():
+            locked = Appointment.objects.select_for_update().get(id=appointment.id)
+            if locked.status != 'confirmed':
+                return Response(
+                    {
+                        'error': True,
+                        'message': f"Cannot complete appointment with status '{locked.status}'. Only 'confirmed' appointments can be completed.",
+                        'detail': f"Cannot complete appointment with status '{locked.status}'. Only 'confirmed' appointments can be completed.",
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+            locked.status = 'completed'
+            locked.save(update_fields=['status', 'updated_at'])
+            return Response(self.get_serializer(locked).data)
 
 
 class DoctorAvailabilityViewSet(viewsets.ModelViewSet):
