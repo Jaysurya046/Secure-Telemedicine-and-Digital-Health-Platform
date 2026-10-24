@@ -7,6 +7,7 @@ from django.urls import reverse
 from django.utils.module_loading import import_string
 from rest_framework import status
 from rest_framework.test import APITestCase
+from rest_framework.throttling import AnonRateThrottle
 from apps.users.models import UserProfile, DoctorProfile, PatientMedicalInfo
 from apps.users.serializers import UserSerializer
 from django_redis.pool import ConnectionFactory
@@ -638,7 +639,21 @@ class UserProfileAccessControlTests(APITestCase):
         self.assertTrue(DoctorProfile.objects.filter(user=doc, specialization='Pediatrics').exists())
 
 
-class RedisCacheCompatibilityTests(SimpleTestCase):
+def _get_sanitized_redis_url(raw_url: str) -> str:
+    """Strip authentication credentials from Redis URL for safe diagnostics."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(raw_url)
+        scheme = parsed.scheme or 'redis'
+        host = parsed.hostname or 'localhost'
+        port_part = f":{parsed.port}" if parsed.port else ""
+        path = parsed.path or "/0"
+        return f"{scheme}://{host}{port_part}{path}"
+    except Exception:
+        return "redis://localhost:6379/0"
+
+
+class RedisCacheCompatibilityTests(APITestCase):
     """
     Step 2A regression tests for Redis cache compatibility.
     Verifies that:
@@ -646,8 +661,9 @@ class RedisCacheCompatibilityTests(SimpleTestCase):
     - Initializing the cache client, connection factory, and connection pool
       succeeds without throwing ImportError (which occurred with HiredisParser)
       and without requiring a running Redis server.
-    - If a live Redis server is running, verifies cache set/get and throttled requests.
-    - If live Redis is not available, clearly reports the skipped live checks.
+    - If a live Redis server is running, verifies cache set/get and an actual DRF
+      request sequence reaching HTTP 429 using a Redis-backed test cache with unique prefix.
+    - If live Redis is not available, clearly reports the skipped live checks without exposing credentials.
     """
 
     def test_production_cache_config_uses_supported_default_parser(self):
@@ -698,30 +714,93 @@ class RedisCacheCompatibilityTests(SimpleTestCase):
 
     def test_live_redis_roundtrip_and_throttling_if_available(self):
         """
-        If a live Redis server is available at REDIS_URL, verify cache set/get round-trip
-        and throttled API requests. If unavailable, clearly skip and report.
+        If a live Redis server is available at REDIS_URL:
+        - Configure a Redis-backed test cache using production options and unique key prefix.
+        - Verify cache set/get round-trip.
+        - Verify an actual DRF request sequence reaching HTTP 429.
+        - Clean up all test keys.
+        If unavailable, clearly skip with credentials stripped from diagnostics.
         """
         is_available = False
         try:
-            client = redis.Redis.from_url(prod_settings.REDIS_URL, socket_connect_timeout=0.5)
-            is_available = (client.ping() is True)
+            probe_client = redis.Redis.from_url(
+                prod_settings.REDIS_URL,
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5
+            )
+            is_available = (probe_client.ping() is True)
+            probe_client.close()
         except Exception:
             is_available = False
 
         if not is_available:
+            safe_url = _get_sanitized_redis_url(prod_settings.REDIS_URL)
             self.skipTest(
-                f"Live Redis server not reachable at {prod_settings.REDIS_URL}. "
+                f"Live Redis server not reachable at {safe_url}. "
                 "Integration round-trip and live throttling verification skipped."
             )
 
-        # When Redis is available, test set/get roundtrip on production cache
-        from django.core.cache import caches
-        prod_cache = caches['default']
-        test_key = 'telemedicine_test_roundtrip'
-        test_val = {'status': 'active', 'tokens': 42}
-        try:
-            prod_cache.set(test_key, test_val, timeout=30)
-            self.assertEqual(prod_cache.get(test_key), test_val)
-        finally:
-            prod_cache.delete(test_key)
+        # Configure Redis-backed test cache using production options with a unique key prefix
+        test_cache_config = {
+            'default': {
+                'BACKEND': 'django_redis.cache.RedisCache',
+                'LOCATION': prod_settings.REDIS_URL,
+                'OPTIONS': dict(prod_settings.CACHES['default']['OPTIONS']),
+                'KEY_PREFIX': 'test_telemedicine_step2a',
+                'TIMEOUT': 60,
+            }
+        }
+
+        with self.settings(CACHES=test_cache_config):
+            from django.core.cache import caches
+            redis_cache = caches['default']
+            test_key = 'roundtrip_probe_key'
+            test_val = {'status': 'healthy', 'payload': 12345}
+
+            orig_rate = AnonRateThrottle.THROTTLE_RATES.get('anon')
+            AnonRateThrottle.THROTTLE_RATES['anon'] = '2/min'
+
+            try:
+                # Pre-clean any leftover keys
+                try:
+                    redis_cache.delete_pattern('*')
+                except Exception:
+                    pass
+
+                # 1. Verify set/get round-trip on Redis-backed cache
+                redis_cache.set(test_key, test_val, timeout=30)
+                self.assertEqual(redis_cache.get(test_key), test_val)
+
+                # 2. Verify DRF throttling request sequence reaches HTTP 429
+                stats_url = reverse('statistics')
+                r1 = self.client.get(stats_url)
+                r2 = self.client.get(stats_url)
+                r3 = self.client.get(stats_url)
+
+                self.assertEqual(r1.status_code, status.HTTP_200_OK)
+                self.assertEqual(r2.status_code, status.HTTP_200_OK)
+                self.assertEqual(
+                    r3.status_code,
+                    status.HTTP_429_TOO_MANY_REQUESTS,
+                    f"Expected 429 Too Many Requests on 3rd request, got {r3.status_code}"
+                )
+            finally:
+                # Clean up rate limit setting
+                AnonRateThrottle.THROTTLE_RATES['anon'] = orig_rate
+
+                # Clean up test keys from Redis
+                try:
+                    redis_cache.delete(test_key)
+                    redis_cache.delete_pattern('*')
+                except Exception:
+                    pass
+                try:
+                    raw_cleanup_client = redis.Redis.from_url(prod_settings.REDIS_URL)
+                    keys = raw_cleanup_client.keys('test_telemedicine_step2a:*')
+                    if keys:
+                        raw_cleanup_client.delete(*keys)
+                    raw_cleanup_client.close()
+                except Exception:
+                    pass
+
 
