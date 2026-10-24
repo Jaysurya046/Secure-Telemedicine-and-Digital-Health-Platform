@@ -2,6 +2,7 @@
 from collections.abc import Mapping
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
+from rest_framework.fields import empty
 
 from apps.appointments.models import Appointment
 from apps.users.serializers import DoctorListSerializer, PatientListSerializer
@@ -17,10 +18,16 @@ class ConsultationMessageSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'sender', 'sender_email', 'sent_at']
 
 
+class OptionalBooleanField(serializers.BooleanField):
+    """Boolean field that does not default to False when omitted in multipart/form data."""
+    default_empty_html = empty
+
+
 class ConsultationSerializer(serializers.ModelSerializer):
     patient_detail = PatientListSerializer(source='patient', read_only=True)
     doctor_detail = DoctorListSerializer(source='doctor', read_only=True)
     messages = ConsultationMessageSerializer(many=True, read_only=True)
+    follow_up_required = OptionalBooleanField(required=False)
 
     class Meta:
         model = Consultation
@@ -211,7 +218,7 @@ class ConsultationEndSerializer(serializers.Serializer):
 
     diagnosis = serializers.CharField(required=False, allow_blank=True)
     clinical_notes = serializers.CharField(required=False, allow_blank=True)
-    follow_up_required = serializers.BooleanField(required=False)
+    follow_up_required = OptionalBooleanField(required=False)
     follow_up_notes = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, attrs):

@@ -1098,6 +1098,122 @@ class ConsultationLifecycleTransitionTests(APITestCase):
         self.consultation.refresh_from_db()
         self.assertEqual(self.consultation.status, 'in_progress')
 
+    def test_end_omitted_follow_up_required_and_clinical_fields_preserve_stored_values(self):
+        """Ending a consultation with omitted optional clinical fields preserves stored values.
+
+        Starting with follow_up_required=True:
+        - Multipart end omitting the flag preserves True.
+        - JSON {} and bodyless end preserve True.
+        - Explicit false changes it to False.
+        - Invalid boolean values return 400.
+        """
+        self.client.force_authenticate(user=self.doctor)
+
+        # 1. Multipart end omitting follow_up_required preserves True
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.diagnosis = 'Stored diagnosis'
+        self.consultation.clinical_notes = 'Stored notes'
+        self.consultation.follow_up_notes = 'Stored follow up notes'
+        self.consultation.save()
+
+        res_multipart = self.client.post(
+            self.end_url(self.consultation.id),
+            data={'diagnosis': 'Updated via multipart'},
+            format='multipart',
+        )
+        self.assertEqual(res_multipart.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertTrue(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.diagnosis, 'Updated via multipart')
+        self.assertEqual(self.consultation.clinical_notes, 'Stored notes')
+        self.assertEqual(self.consultation.follow_up_notes, 'Stored follow up notes')
+
+        # 2. JSON {} end preserves True and all stored clinical fields
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.diagnosis = 'Preserved diagnosis'
+        self.consultation.clinical_notes = 'Preserved notes'
+        self.consultation.follow_up_notes = 'Preserved follow up'
+        self.consultation.save()
+
+        res_empty_json = self.client.post(
+            self.end_url(self.consultation.id),
+            data={},
+            format='json',
+        )
+        self.assertEqual(res_empty_json.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertTrue(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.diagnosis, 'Preserved diagnosis')
+        self.assertEqual(self.consultation.clinical_notes, 'Preserved notes')
+        self.assertEqual(self.consultation.follow_up_notes, 'Preserved follow up')
+
+        # 3. Bodyless end preserves True and all stored clinical fields
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.diagnosis = 'Preserved diagnosis'
+        self.consultation.clinical_notes = 'Preserved notes'
+        self.consultation.follow_up_notes = 'Preserved follow up'
+        self.consultation.save()
+
+        res_bodyless = self.client.post(self.end_url(self.consultation.id))
+        self.assertEqual(res_bodyless.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertTrue(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.diagnosis, 'Preserved diagnosis')
+        self.assertEqual(self.consultation.clinical_notes, 'Preserved notes')
+        self.assertEqual(self.consultation.follow_up_notes, 'Preserved follow up')
+
+        # 4. Explicit false changes follow_up_required to False (tested in JSON and multipart)
+        # 4a. Explicit false in JSON
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+
+        res_false_json = self.client.post(
+            self.end_url(self.consultation.id),
+            data={'follow_up_required': False},
+            format='json',
+        )
+        self.assertEqual(res_false_json.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # 4b. Explicit false in multipart ('false')
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+
+        res_false_multipart = self.client.post(
+            self.end_url(self.consultation.id),
+            data={'follow_up_required': 'false'},
+            format='multipart',
+        )
+        self.assertEqual(res_false_multipart.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # 5. Invalid boolean values must still return 400 and preserve stored state
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+
+        res_invalid_multipart = self.client.post(
+            self.end_url(self.consultation.id),
+            data={'follow_up_required': 'not_a_boolean'},
+            format='multipart',
+        )
+        self.assertEqual(res_invalid_multipart.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertTrue(self.consultation.follow_up_required)
+
     # =========================================================================
     # 4. Malformed Bodies and Invalid Fields Return 400 Before Any Writes
     # =========================================================================
