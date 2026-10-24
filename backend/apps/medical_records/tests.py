@@ -1185,3 +1185,93 @@ class ClinicalOwnershipAndReferenceProtectionTests(BaseClinicalAccessTestCase):
         self.assertIn('consultation', self.get_error_details(bad_update_res))
         rec_cleared.refresh_from_db()
         self.assertIsNone(rec_cleared.consultation)
+
+    def test_malformed_payload_shapes_return_400_and_leave_db_unchanged(self):
+        """
+        Non-object request payloads (arrays, strings, numbers, booleans) must return 400 Bad Request
+        and leave medical records, prescriptions, and prescription items unchanged.
+        """
+        self.client.force_authenticate(user=self.doctor_1)
+
+        initial_record_count = MedicalRecord.objects.count()
+        initial_prescription_count = Prescription.objects.count()
+        initial_item_count = PrescriptionItem.objects.count()
+
+        malformed_payloads = [
+            [],
+            ['unexpected', 'list', 'item'],
+            'invalid',
+            '',
+            42,
+            0,
+            3.14,
+            True,
+            False,
+        ]
+
+        for payload in malformed_payloads:
+            # Test medical record creation
+            rec_res = self.client.post(self.record_list_url, payload, format='json')
+            self.assertEqual(
+                rec_res.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                f"Expected 400 for medical record with payload {payload!r}, got {rec_res.status_code}",
+            )
+
+            # Test prescription creation
+            rx_res = self.client.post(self.prescription_list_url, payload, format='json')
+            self.assertEqual(
+                rx_res.status_code,
+                status.HTTP_400_BAD_REQUEST,
+                f"Expected 400 for prescription with payload {payload!r}, got {rx_res.status_code}",
+            )
+
+        # Assert no changes in database rows or prescription items
+        self.assertEqual(MedicalRecord.objects.count(), initial_record_count)
+        self.assertEqual(Prescription.objects.count(), initial_prescription_count)
+        self.assertEqual(PrescriptionItem.objects.count(), initial_item_count)
+
+    def test_valid_json_object_and_form_data_creation_succeed(self):
+        """
+        Valid JSON objects and form-data payloads succeed and correctly inject/derive doctor.
+        """
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # 1. Valid JSON object for record
+        rec_json_res = self.client.post(self.record_list_url, {
+            'patient': str(self.patient_1.id),
+            'title': 'JSON Object Record',
+            'description': 'Created via JSON object',
+        }, format='json')
+        self.assertEqual(rec_json_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(rec_json_res.data['doctor']), str(self.doctor_1.id))
+
+        # 2. Valid form-data payload for record
+        rec_form_res = self.client.post(self.record_list_url, {
+            'patient': str(self.patient_1.id),
+            'title': 'Form Data Record',
+            'description': 'Created via form data',
+        })
+        self.assertEqual(rec_form_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(rec_form_res.data['doctor']), str(self.doctor_1.id))
+
+        # 3. Valid JSON object for prescription with items
+        rx_json_res = self.client.post(self.prescription_list_url, {
+            'patient': str(self.patient_1.id),
+            'instructions': 'Take after food',
+            'items': [
+                {'medication_name': 'Amoxicillin', 'dosage': '500mg', 'frequency': '3 times daily', 'duration': '7 days'}
+            ],
+        }, format='json')
+        self.assertEqual(rx_json_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(rx_json_res.data['doctor']), str(self.doctor_1.id))
+        self.assertEqual(len(rx_json_res.data.get('items', [])), 1)
+
+        # 4. Valid form-data payload for prescription
+        rx_form_res = self.client.post(self.prescription_list_url, {
+            'patient': str(self.patient_1.id),
+            'instructions': 'Drink plenty of fluids',
+        })
+        self.assertEqual(rx_form_res.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(str(rx_form_res.data['doctor']), str(self.doctor_1.id))
+

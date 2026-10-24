@@ -1,4 +1,5 @@
 """Serializers for medical records."""
+from collections.abc import Mapping
 from rest_framework import serializers
 
 from apps.users.serializers import DoctorListSerializer, PatientListSerializer
@@ -35,9 +36,12 @@ class ClinicalOwnershipValidationMixin:
     """
 
     def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
+
         if hasattr(data, 'copy'):
             data = data.copy()
-        elif isinstance(data, dict):
+        else:
             data = dict(data)
 
         request = self.context.get('request')
