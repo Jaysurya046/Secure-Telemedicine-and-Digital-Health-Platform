@@ -189,3 +189,37 @@ class ConsultationSerializer(serializers.ModelSerializer):
         if value.role != 'doctor':
             raise serializers.ValidationError('Selected user must be a doctor.')
         return value
+
+
+class ConsultationStartSerializer(serializers.Serializer):
+    """Supporting serializer for starting a consultation session."""
+
+    def validate(self, attrs):
+        if isinstance(self.initial_data, Mapping):
+            extra_fields = set(self.initial_data.keys())
+            if extra_fields:
+                raise serializers.ValidationError({
+                    field: f"Unexpected field '{field}'."
+                    for field in sorted(extra_fields)
+                })
+        return attrs
+
+
+class ConsultationEndSerializer(serializers.Serializer):
+    """Supporting serializer for ending a consultation session and validating clinical fields."""
+    ALLOWED_FIELDS = {'diagnosis', 'clinical_notes', 'follow_up_required', 'follow_up_notes'}
+
+    diagnosis = serializers.CharField(required=False, allow_blank=True)
+    clinical_notes = serializers.CharField(required=False, allow_blank=True)
+    follow_up_required = serializers.BooleanField(required=False)
+    follow_up_notes = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if isinstance(self.initial_data, Mapping):
+            extra_fields = set(self.initial_data.keys()) - self.ALLOWED_FIELDS
+            if extra_fields:
+                raise serializers.ValidationError({
+                    field: f"Unexpected field '{field}'."
+                    for field in sorted(extra_fields)
+                })
+        return attrs

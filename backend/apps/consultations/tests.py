@@ -794,3 +794,407 @@ class ConsultationWriteAndOwnershipProtectionTests(APITestCase):
         )
         self.assertEqual(self.consultation.messages.count(), 0)
 
+
+class ConsultationLifecycleTransitionTests(APITestCase):
+    """
+    Feature 3F: Validate consultation lifecycle transitions.
+
+    Rules:
+    - start permits only scheduled -> in_progress.
+    - end permits only in_progress -> completed.
+    - Invalid or repeated transitions return 409 without changing status, timestamps, or clinical fields.
+    - Completed and cancelled consultations cannot restart.
+    - Set timestamps server-side; successful completion preserves started_at.
+    - Validate end-action clinical fields through a serializer. Parse follow_up_required correctly; never use bool(request.data[...]).
+    - Malformed bodies and invalid fields return 400 before any writes.
+    - Make transition checks and persistence atomic, with appropriate row locking.
+    - Preserve Feature 3E authorization and ownership rules.
+    """
+
+    def setUp(self):
+        # Patient
+        self.patient = User.objects.create_user(
+            email='pat_f3f@example.com',
+            password='Password123!@#',
+            role='patient',
+        )
+        UserProfile.objects.create(user=self.patient, first_name='Patient', last_name='F3F')
+
+        # Assigned Doctor
+        self.doctor = User.objects.create_user(
+            email='doc_f3f@example.com',
+            password='Password123!@#',
+            role='doctor',
+        )
+        UserProfile.objects.create(user=self.doctor, first_name='Doctor', last_name='F3F')
+        DoctorProfile.objects.create(user=self.doctor, specialization='General Medicine', license_number='DOC_F3F')
+
+        # Other Doctor
+        self.other_doctor = User.objects.create_user(
+            email='otherdoc_f3f@example.com',
+            password='Password123!@#',
+            role='doctor',
+        )
+        UserProfile.objects.create(user=self.other_doctor, first_name='Other', last_name='Doctor')
+        DoctorProfile.objects.create(user=self.other_doctor, specialization='Cardiology', license_number='OTHERDOC_F3F')
+
+        # Admin
+        self.admin = User.objects.create_user(
+            email='admin_f3f@example.com',
+            password='Password123!@#',
+            role='admin',
+            is_staff=True,
+        )
+
+        # Confirmed appointment
+        now = timezone.now()
+        self.appointment = Appointment.objects.create(
+            doctor=self.doctor,
+            patient=self.patient,
+            status='confirmed',
+            scheduled_start=now + datetime.timedelta(days=1),
+            scheduled_end=now + datetime.timedelta(days=1, hours=1),
+            reason='Routine checkup',
+        )
+
+        # Baseline consultation in 'scheduled' status
+        self.consultation = Consultation.objects.create(
+            appointment=self.appointment,
+            patient=self.patient,
+            doctor=self.doctor,
+            status='scheduled',
+            chief_complaint='Persistent cough',
+            diagnosis='Initial observation',
+            clinical_notes='Awaiting examination',
+            follow_up_required=False,
+            follow_up_notes='Initial plan',
+        )
+
+    def start_url(self, pk):
+        return reverse('consultation-start', kwargs={'pk': pk})
+
+    def end_url(self, pk):
+        return reverse('consultation-end', kwargs={'pk': pk})
+
+    def detail_url(self, pk):
+        return reverse('consultation-detail', kwargs={'pk': pk})
+
+    # =========================================================================
+    # 1. Transition Matrix: start permits only scheduled -> in_progress
+    # =========================================================================
+
+    def test_start_valid_transition_scheduled_to_in_progress(self):
+        """start permits scheduled -> in_progress and sets started_at server-side."""
+        self.client.force_authenticate(user=self.doctor)
+        before = timezone.now()
+
+        res = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertIsNotNone(self.consultation.started_at)
+        self.assertGreaterEqual(self.consultation.started_at, before)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(res.data['status'], 'in_progress')
+
+    def test_start_repeated_and_invalid_transitions_return_409(self):
+        """start rejects in_progress, completed, and cancelled with 409 without modifying state."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # Case 1: Repeated start on in_progress
+        self.consultation.status = 'in_progress'
+        fixed_started_at = timezone.now() - datetime.timedelta(minutes=15)
+        self.consultation.started_at = fixed_started_at
+        self.consultation.save()
+
+        res_rep = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res_rep.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertIsNone(self.consultation.ended_at)
+
+        # Case 2: Cannot restart completed consultation
+        self.consultation.status = 'completed'
+        fixed_ended_at = timezone.now() - datetime.timedelta(minutes=5)
+        self.consultation.ended_at = fixed_ended_at
+        self.consultation.save()
+
+        res_comp = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res_comp.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertEqual(self.consultation.ended_at, fixed_ended_at)
+
+        # Case 3: Cannot restart cancelled consultation
+        self.consultation.status = 'cancelled'
+        self.consultation.save()
+
+        res_canc = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res_canc.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'cancelled')
+
+    # =========================================================================
+    # 2. Transition Matrix: end permits only in_progress -> completed
+    # =========================================================================
+
+    def test_end_valid_transition_in_progress_to_completed_and_preserves_started_at(self):
+        """end permits in_progress -> completed, sets ended_at, and preserves started_at."""
+        self.client.force_authenticate(user=self.doctor)
+        fixed_started_at = timezone.now() - datetime.timedelta(minutes=30)
+        self.consultation.status = 'in_progress'
+        self.consultation.started_at = fixed_started_at
+        self.consultation.save()
+
+        before = timezone.now()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'diagnosis': 'Acute Bronchitis',
+            'clinical_notes': 'Prescribed rest and hydration.',
+            'follow_up_required': True,
+            'follow_up_notes': 'Return in 10 days if symptoms persist.',
+        }, format='json')
+
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)  # Preserved!
+        self.assertIsNotNone(self.consultation.ended_at)
+        self.assertGreaterEqual(self.consultation.ended_at, before)
+        self.assertEqual(self.consultation.diagnosis, 'Acute Bronchitis')
+        self.assertEqual(self.consultation.clinical_notes, 'Prescribed rest and hydration.')
+        self.assertTrue(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.follow_up_notes, 'Return in 10 days if symptoms persist.')
+
+    def test_end_repeated_and_invalid_transitions_return_409(self):
+        """end rejects scheduled, completed, and cancelled consultations with 409."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # Case 1: end on scheduled (cannot end before start)
+        self.consultation.status = 'scheduled'
+        self.consultation.save()
+
+        res_sched = self.client.post(self.end_url(self.consultation.id), {
+            'diagnosis': 'Premature end',
+        }, format='json')
+        self.assertEqual(res_sched.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'scheduled')
+        self.assertIsNone(self.consultation.started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+
+        # Case 2: Repeated end on completed
+        self.consultation.status = 'completed'
+        fixed_started_at = timezone.now() - datetime.timedelta(hours=1)
+        fixed_ended_at = timezone.now() - datetime.timedelta(minutes=30)
+        self.consultation.started_at = fixed_started_at
+        self.consultation.ended_at = fixed_ended_at
+        self.consultation.save()
+
+        res_comp = self.client.post(self.end_url(self.consultation.id), {
+            'diagnosis': 'Overwriting diagnosis',
+        }, format='json')
+        self.assertEqual(res_comp.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertEqual(self.consultation.ended_at, fixed_ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+
+        # Case 3: end on cancelled
+        self.consultation.status = 'cancelled'
+        self.consultation.save()
+
+        res_canc = self.client.post(self.end_url(self.consultation.id), {
+            'diagnosis': 'Cancelled end',
+        }, format='json')
+        self.assertEqual(res_canc.status_code, status.HTTP_409_CONFLICT)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'cancelled')
+
+    # =========================================================================
+    # 3. Boolean Validation for follow_up_required
+    # =========================================================================
+
+    def test_follow_up_required_boolean_parsing(self):
+        """follow_up_required correctly handles booleans, strings 'true'/'false', 0/1, and rejects invalid strings."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # Subtest 1: 'false' string must be False (not True like python bool('false'))
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': 'false',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # Subtest 2: '0' string must be False
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': '0',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # Subtest 3: raw boolean False
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = True
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': False,
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # Subtest 4: 'true' string must be True
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = False
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': 'true',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertTrue(self.consultation.follow_up_required)
+
+        # Subtest 5: '1' string must be True
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = False
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': '1',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertTrue(self.consultation.follow_up_required)
+
+        # Subtest 6: Invalid string returns 400 Bad Request without writing
+        self.consultation.status = 'in_progress'
+        self.consultation.follow_up_required = False
+        self.consultation.save()
+        res = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': 'invalid_boolean',
+        }, format='json')
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertFalse(self.consultation.follow_up_required)
+
+        # Subtest 7: null/None returns 400 Bad Request
+        res_null = self.client.post(self.end_url(self.consultation.id), {
+            'follow_up_required': None,
+        }, format='json')
+        self.assertEqual(res_null.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+
+    # =========================================================================
+    # 4. Malformed Bodies and Invalid Fields Return 400 Before Any Writes
+    # =========================================================================
+
+    def test_start_malformed_bodies_and_invalid_fields_return_400(self):
+        """start returns 400 before any writes when body is non-mapping or contains invalid fields."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # Array body
+        res_list = self.client.post(self.start_url(self.consultation.id), data=[], format='json')
+        self.assertEqual(res_list.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # String body
+        res_str = self.client.post(self.start_url(self.consultation.id), data='invalid', format='json')
+        self.assertEqual(res_str.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Number body
+        res_num = self.client.post(self.start_url(self.consultation.id), data=42, format='json')
+        self.assertEqual(res_num.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Unexpected/invalid field
+        res_field = self.client.post(
+            self.start_url(self.consultation.id),
+            data={'unexpected_param': 'test'},
+            format='json',
+        )
+        self.assertEqual(res_field.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # State remains scheduled and unwritten
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'scheduled')
+        self.assertIsNone(self.consultation.started_at)
+
+    def test_end_malformed_bodies_and_invalid_fields_return_400(self):
+        """end returns 400 before any writes when body is non-mapping or contains invalid fields."""
+        self.client.force_authenticate(user=self.doctor)
+        self.consultation.status = 'in_progress'
+        fixed_started_at = timezone.now() - datetime.timedelta(minutes=20)
+        self.consultation.started_at = fixed_started_at
+        self.consultation.save()
+
+        # Array body
+        res_list = self.client.post(self.end_url(self.consultation.id), data=[], format='json')
+        self.assertEqual(res_list.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # String body
+        res_str = self.client.post(self.end_url(self.consultation.id), data='invalid', format='json')
+        self.assertEqual(res_str.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Number body
+        res_num = self.client.post(self.end_url(self.consultation.id), data=42, format='json')
+        self.assertEqual(res_num.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # Unexpected/invalid field
+        res_field = self.client.post(
+            self.end_url(self.consultation.id),
+            data={'invalid_field_name': 'value'},
+            format='json',
+        )
+        self.assertEqual(res_field.status_code, status.HTTP_400_BAD_REQUEST)
+
+        # State remains in_progress and clinical fields untouched
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+
+    # =========================================================================
+    # 5. Role Permissions and Authorization (Feature 3E Rules Preserved)
+    # =========================================================================
+
+    def test_role_authorization_preserved_on_start_and_end(self):
+        """Patients, unassigned doctors, and unauthenticated users cannot invoke start/end."""
+        # Patient
+        self.client.force_authenticate(user=self.patient)
+        self.assertEqual(self.client.post(self.start_url(self.consultation.id)).status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(self.client.post(self.end_url(self.consultation.id)).status_code, status.HTTP_403_FORBIDDEN)
+
+        # Unassigned doctor (returns 404 because scoped queryset hides it)
+        self.client.force_authenticate(user=self.other_doctor)
+        self.assertEqual(self.client.post(self.start_url(self.consultation.id)).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.post(self.end_url(self.consultation.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Unauthenticated
+        self.client.logout()
+        self.assertEqual(self.client.post(self.start_url(self.consultation.id)).status_code, status.HTTP_401_UNAUTHORIZED)
+        self.assertEqual(self.client.post(self.end_url(self.consultation.id)).status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # Admin can start and end
+        self.client.force_authenticate(user=self.admin)
+        res_start = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res_start.status_code, status.HTTP_200_OK)
+        res_end = self.client.post(self.end_url(self.consultation.id), {
+            'diagnosis': 'Admin completed consultation',
+        }, format='json')
+        self.assertEqual(res_end.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+
