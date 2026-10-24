@@ -9,6 +9,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from django.contrib.auth import get_user_model, authenticate
 from django.db import transaction
+from django.db.models import Q
 from drf_spectacular.utils import extend_schema, OpenApiParameter
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import filters
@@ -362,18 +363,24 @@ class PatientViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        queryset = User.objects.filter(
+        if not user.is_authenticated:
+            return User.objects.none()
+
+        base_queryset = User.objects.filter(
             role='patient',
             is_active=True
         ).select_related('profile', 'medical_info')
-        
-        # Doctors can only see their patients
-        if user.is_doctor:
-            # This will be filtered based on appointments when that app is created
-            # For now, return all patients
-            pass
-        
-        return queryset
+
+        if user.role == 'admin':
+            return base_queryset
+
+        if user.role == 'doctor':
+            return base_queryset.filter(
+                Q(patient_appointments__doctor=user, patient_appointments__status__in=['confirmed', 'completed']) |
+                (Q(patient_consultations__doctor=user) & ~Q(patient_consultations__status='cancelled'))
+            ).distinct()
+
+        return User.objects.none()
     
     def get_serializer_class(self):
         if self.action == 'retrieve':

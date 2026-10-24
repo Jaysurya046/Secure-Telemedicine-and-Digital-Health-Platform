@@ -12,6 +12,10 @@ from apps.users.models import UserProfile, DoctorProfile, PatientMedicalInfo
 from apps.users.serializers import UserSerializer
 from django_redis.pool import ConnectionFactory
 from redis.connection import BaseParser
+import datetime
+from django.utils import timezone
+from apps.appointments.models import Appointment
+from apps.consultations.models import Consultation
 import redis
 import config.settings as prod_settings
 
@@ -802,5 +806,370 @@ class RedisCacheCompatibilityTests(APITestCase):
                     raw_cleanup_client.close()
                 except Exception:
                     pass
+
+
+class PatientDirectoryAccessScopingTests(APITestCase):
+    """
+    Feature 3C: Scope patient directory access.
+    
+    Requirements:
+    - Doctors may see active patients linked to them through a confirmed/completed appointment
+      or a non-cancelled consultation.
+    - Pending/cancelled appointments alone do not grant directory access.
+    - Admins retain access to all active patients.
+    - Patients, unsupported roles, and unauthenticated users remain denied.
+    - Apply the same scoped queryset to list, search, pagination, and detail lookup.
+    - Unrelated patient detail requests must return 404.
+    - Multiple qualifying relationships do not duplicate patients.
+    """
+
+    def setUp(self):
+        self.patient_list_url = reverse('patient-list')
+
+        # Doctors
+        self.doctor_1 = User.objects.create_user(
+            email='doctor1_f3c@example.com',
+            password='Password123!@#',
+            role='doctor',
+        )
+        UserProfile.objects.create(user=self.doctor_1, first_name='Doctor', last_name='One')
+        DoctorProfile.objects.create(user=self.doctor_1, specialization='Cardiology', license_number='DOC1_F3C_LIC')
+
+        self.doctor_2 = User.objects.create_user(
+            email='doctor2_f3c@example.com',
+            password='Password123!@#',
+            role='doctor',
+        )
+        UserProfile.objects.create(user=self.doctor_2, first_name='Doctor', last_name='Two')
+        DoctorProfile.objects.create(user=self.doctor_2, specialization='Neurology', license_number='DOC2_F3C_LIC')
+
+        # Admin
+        self.admin = User.objects.create_user(
+            email='admin_f3c@example.com',
+            password='Password123!@#',
+            role='admin',
+            is_staff=True,
+        )
+
+        # Patient & Unsupported role callers
+        self.caller_patient = User.objects.create_user(
+            email='caller_patient_f3c@example.com',
+            password='Password123!@#',
+            role='patient',
+        )
+        self.caller_nurse = User.objects.create_user(
+            email='caller_nurse_f3c@example.com',
+            password='Password123!@#',
+            role='nurse',
+        )
+
+    def create_patient(self, email, first_name='Pat', last_name='Test', is_active=True):
+        patient = User.objects.create_user(
+            email=email,
+            password='Password123!@#',
+            role='patient',
+            is_active=is_active,
+        )
+        UserProfile.objects.create(user=patient, first_name=first_name, last_name=last_name)
+        PatientMedicalInfo.objects.create(user=patient, blood_group='O+')
+        return patient
+
+    def create_appointment(self, doctor, patient, status='confirmed'):
+        now = timezone.now()
+        return Appointment.objects.create(
+            doctor=doctor,
+            patient=patient,
+            status=status,
+            scheduled_start=now,
+            scheduled_end=now + datetime.timedelta(hours=1),
+            reason='Consultation appointment',
+        )
+
+    def create_consultation(self, doctor, patient, status='scheduled'):
+        return Consultation.objects.create(
+            doctor=doctor,
+            patient=patient,
+            status=status,
+            chief_complaint='Follow up',
+        )
+
+    def detail_url(self, patient_id):
+        return reverse('patient-detail', kwargs={'pk': patient_id})
+
+    def test_relationship_source_confirmed_and_completed_appointments_grant_access(self):
+        """Confirmed or completed appointments grant access to the patient in list and detail."""
+        p_confirmed = self.create_patient('p_confirmed@example.com', first_name='ConfirmedPat')
+        p_completed = self.create_patient('p_completed@example.com', first_name='CompletedPat')
+
+        self.create_appointment(self.doctor_1, p_confirmed, status='confirmed')
+        self.create_appointment(self.doctor_1, p_completed, status='completed')
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # List
+        res = self.client.get(self.patient_list_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        returned_ids = [item['id'] for item in res.data['results']]
+        self.assertIn(str(p_confirmed.id), returned_ids)
+        self.assertIn(str(p_completed.id), returned_ids)
+
+        # Detail
+        res_conf = self.client.get(self.detail_url(p_confirmed.id))
+        self.assertEqual(res_conf.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_conf.data['id'], str(p_confirmed.id))
+
+        res_comp = self.client.get(self.detail_url(p_completed.id))
+        self.assertEqual(res_comp.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_comp.data['id'], str(p_completed.id))
+
+    def test_relationship_source_non_cancelled_consultations_grant_access(self):
+        """Non-cancelled consultations (scheduled, in_progress, completed) grant access in list and detail."""
+        p_sched = self.create_patient('p_sched@example.com', first_name='SchedPat')
+        p_prog = self.create_patient('p_prog@example.com', first_name='ProgPat')
+        p_comp = self.create_patient('p_comp@example.com', first_name='CompPat')
+
+        self.create_consultation(self.doctor_1, p_sched, status='scheduled')
+        self.create_consultation(self.doctor_1, p_prog, status='in_progress')
+        self.create_consultation(self.doctor_1, p_comp, status='completed')
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        res = self.client.get(self.patient_list_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        returned_ids = [item['id'] for item in res.data['results']]
+        self.assertIn(str(p_sched.id), returned_ids)
+        self.assertIn(str(p_prog.id), returned_ids)
+        self.assertIn(str(p_comp.id), returned_ids)
+
+        # Detail
+        for pat in [p_sched, p_prog, p_comp]:
+            detail_res = self.client.get(self.detail_url(pat.id))
+            self.assertEqual(detail_res.status_code, status.HTTP_200_OK)
+            self.assertEqual(detail_res.data['id'], str(pat.id))
+
+    def test_excluded_statuses_alone_do_not_grant_access(self):
+        """
+        Pending, cancelled, or no-show appointments and cancelled consultations alone do not grant access.
+        Detail requests return 404 Not Found.
+        """
+        p_pending = self.create_patient('p_pending@example.com')
+        p_cancelled_appt = self.create_patient('p_canc_appt@example.com')
+        p_noshow = self.create_patient('p_noshow@example.com')
+        p_cancelled_consult = self.create_patient('p_canc_consult@example.com')
+        p_pending_and_cancelled = self.create_patient('p_pending_canc@example.com')
+
+        self.create_appointment(self.doctor_1, p_pending, status='pending')
+        self.create_appointment(self.doctor_1, p_cancelled_appt, status='cancelled')
+        self.create_appointment(self.doctor_1, p_noshow, status='no_show')
+        self.create_consultation(self.doctor_1, p_cancelled_consult, status='cancelled')
+        self.create_appointment(self.doctor_1, p_pending_and_cancelled, status='pending')
+        self.create_consultation(self.doctor_1, p_pending_and_cancelled, status='cancelled')
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        res = self.client.get(self.patient_list_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        returned_ids = [item['id'] for item in res.data['results']]
+
+        for pat in [p_pending, p_cancelled_appt, p_noshow, p_cancelled_consult, p_pending_and_cancelled]:
+            self.assertNotIn(str(pat.id), returned_ids)
+            detail_res = self.client.get(self.detail_url(pat.id))
+            self.assertEqual(detail_res.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_unrelated_patients_isolated_from_doctor(self):
+        """Unrelated patients (no appointments/consultations, or linked only to other doctors) return 404."""
+        p_unrelated = self.create_patient('p_unrelated@example.com')
+        p_doc2 = self.create_patient('p_doc2@example.com')
+
+        # Link p_doc2 to Doctor 2
+        self.create_appointment(self.doctor_2, p_doc2, status='confirmed')
+        self.create_consultation(self.doctor_2, p_doc2, status='completed')
+
+        # Doctor 1 requests
+        self.client.force_authenticate(user=self.doctor_1)
+        res1 = self.client.get(self.patient_list_url)
+        self.assertEqual(res1.status_code, status.HTTP_200_OK)
+        returned_ids1 = [item['id'] for item in res1.data['results']]
+        self.assertNotIn(str(p_unrelated.id), returned_ids1)
+        self.assertNotIn(str(p_doc2.id), returned_ids1)
+
+        self.assertEqual(self.client.get(self.detail_url(p_unrelated.id)).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.get(self.detail_url(p_doc2.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Doctor 2 can see p_doc2, but not p_unrelated
+        self.client.force_authenticate(user=self.doctor_2)
+        res2 = self.client.get(self.patient_list_url)
+        self.assertEqual(res2.status_code, status.HTTP_200_OK)
+        returned_ids2 = [item['id'] for item in res2.data['results']]
+        self.assertIn(str(p_doc2.id), returned_ids2)
+        self.assertNotIn(str(p_unrelated.id), returned_ids2)
+
+        self.assertEqual(self.client.get(self.detail_url(p_doc2.id)).status_code, status.HTTP_200_OK)
+        self.assertEqual(self.client.get(self.detail_url(p_unrelated.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_inactive_patients_excluded_from_doctor_and_admin(self):
+        """Inactive patients (is_active=False) are excluded from both doctor and admin access."""
+        p_inactive_doc = self.create_patient('p_inact_doc@example.com', is_active=False)
+        self.create_appointment(self.doctor_1, p_inactive_doc, status='confirmed')
+        self.create_consultation(self.doctor_1, p_inactive_doc, status='completed')
+
+        p_inactive_admin = self.create_patient('p_inact_adm@example.com', is_active=False)
+
+        # Doctor check
+        self.client.force_authenticate(user=self.doctor_1)
+        res_doc = self.client.get(self.patient_list_url)
+        returned_ids_doc = [item['id'] for item in res_doc.data['results']]
+        self.assertNotIn(str(p_inactive_doc.id), returned_ids_doc)
+        self.assertNotIn(str(p_inactive_admin.id), returned_ids_doc)
+        self.assertEqual(self.client.get(self.detail_url(p_inactive_doc.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+        # Admin check
+        self.client.force_authenticate(user=self.admin)
+        res_adm = self.client.get(self.patient_list_url)
+        returned_ids_adm = [item['id'] for item in res_adm.data['results']]
+        self.assertNotIn(str(p_inactive_doc.id), returned_ids_adm)
+        self.assertNotIn(str(p_inactive_admin.id), returned_ids_adm)
+        self.assertEqual(self.client.get(self.detail_url(p_inactive_doc.id)).status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(self.client.get(self.detail_url(p_inactive_admin.id)).status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_multiple_qualifying_relationships_do_not_duplicate_patients(self):
+        """A patient linked through multiple qualifying appointments and consultations appears exactly once."""
+        p_multi = self.create_patient('p_multi@example.com', first_name='MultiRelation')
+
+        self.create_appointment(self.doctor_1, p_multi, status='confirmed')
+        self.create_appointment(self.doctor_1, p_multi, status='completed')
+        self.create_consultation(self.doctor_1, p_multi, status='scheduled')
+        self.create_consultation(self.doctor_1, p_multi, status='completed')
+
+        self.client.force_authenticate(user=self.doctor_1)
+        res = self.client.get(self.patient_list_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+
+        matching_items = [item for item in res.data['results'] if item['id'] == str(p_multi.id)]
+        self.assertEqual(len(matching_items), 1, "Patient should appear exactly once in results list")
+        self.assertEqual(res.data['count'], 1)
+
+    def test_search_isolation_between_doctors(self):
+        """Search queries only return matching patients linked to the authenticated doctor."""
+        p_alice = self.create_patient('alice@example.com', first_name='Alice', last_name='Smith')
+        p_alicia = self.create_patient('alicia@example.com', first_name='Alicia', last_name='Keys')
+
+        self.create_appointment(self.doctor_1, p_alice, status='confirmed')
+        self.create_appointment(self.doctor_2, p_alicia, status='confirmed')
+
+        # Doctor 1 search
+        self.client.force_authenticate(user=self.doctor_1)
+        res_doc1 = self.client.get(self.patient_list_url + '?search=Alic')
+        self.assertEqual(res_doc1.status_code, status.HTTP_200_OK)
+        returned_ids_doc1 = [item['id'] for item in res_doc1.data['results']]
+        self.assertIn(str(p_alice.id), returned_ids_doc1)
+        self.assertNotIn(str(p_alicia.id), returned_ids_doc1)
+        self.assertEqual(res_doc1.data['count'], 1)
+
+        # Doctor 2 search
+        self.client.force_authenticate(user=self.doctor_2)
+        res_doc2 = self.client.get(self.patient_list_url + '?search=Alic')
+        self.assertEqual(res_doc2.status_code, status.HTTP_200_OK)
+        returned_ids_doc2 = [item['id'] for item in res_doc2.data['results']]
+        self.assertIn(str(p_alicia.id), returned_ids_doc2)
+        self.assertNotIn(str(p_alice.id), returned_ids_doc2)
+        self.assertEqual(res_doc2.data['count'], 1)
+
+        # Admin search sees both
+        self.client.force_authenticate(user=self.admin)
+        res_admin = self.client.get(self.patient_list_url + '?search=Alic')
+        self.assertEqual(res_admin.status_code, status.HTTP_200_OK)
+        returned_ids_admin = [item['id'] for item in res_admin.data['results']]
+        self.assertIn(str(p_alice.id), returned_ids_admin)
+        self.assertIn(str(p_alicia.id), returned_ids_admin)
+        self.assertEqual(res_admin.data['count'], 2)
+
+    def test_pagination_with_scoped_queryset(self):
+        """Pagination preserves relationship scoping without including cross-doctor patients."""
+        doc1_patients = [
+            self.create_patient(f'p_page_d1_{i}@example.com', first_name=f'P1_{i}')
+            for i in range(25)
+        ]
+        doc2_patients = [
+            self.create_patient(f'p_page_d2_{i}@example.com', first_name=f'P2_{i}')
+            for i in range(5)
+        ]
+
+        for p in doc1_patients:
+            self.create_appointment(self.doctor_1, p, status='confirmed')
+        for p in doc2_patients:
+            self.create_appointment(self.doctor_2, p, status='confirmed')
+
+        self.client.force_authenticate(user=self.doctor_1)
+
+        # Page 1
+        res_page1 = self.client.get(self.patient_list_url)
+        self.assertEqual(res_page1.status_code, status.HTTP_200_OK)
+        self.assertEqual(res_page1.data['count'], 25)
+        self.assertEqual(len(res_page1.data['results']), 20)
+        self.assertIsNotNone(res_page1.data['next'])
+
+        # Page 2
+        res_page2 = self.client.get(res_page1.data['next'])
+        self.assertEqual(res_page2.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(res_page2.data['results']), 5)
+
+        # All 25 are doc1 patients, none are doc2
+        all_returned_ids = {item['id'] for item in res_page1.data['results']} | {item['id'] for item in res_page2.data['results']}
+        doc1_ids = {str(p.id) for p in doc1_patients}
+        doc2_ids = {str(p.id) for p in doc2_patients}
+
+        self.assertEqual(all_returned_ids, doc1_ids)
+        self.assertTrue(all_returned_ids.isdisjoint(doc2_ids))
+
+    def test_admin_access_to_all_active_patients(self):
+        """Admins retain full access to all active patients, whether linked to doctors or unlinked."""
+        p_doc1 = self.create_patient('admin_check_d1@example.com')
+        p_doc2 = self.create_patient('admin_check_d2@example.com')
+        p_unlinked = self.create_patient('admin_check_unlinked@example.com')
+
+        self.create_appointment(self.doctor_1, p_doc1, status='confirmed')
+        self.create_appointment(self.doctor_2, p_doc2, status='confirmed')
+
+        self.client.force_authenticate(user=self.admin)
+        res = self.client.get(self.patient_list_url)
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        returned_ids = [item['id'] for item in res.data['results']]
+
+        self.assertIn(str(p_doc1.id), returned_ids)
+        self.assertIn(str(p_doc2.id), returned_ids)
+        self.assertIn(str(p_unlinked.id), returned_ids)
+
+        for pat in [p_doc1, p_doc2, p_unlinked]:
+            detail_res = self.client.get(self.detail_url(pat.id))
+            self.assertEqual(detail_res.status_code, status.HTTP_200_OK)
+            self.assertEqual(detail_res.data['id'], str(pat.id))
+
+    def test_unauthenticated_and_unsupported_roles_denied(self):
+        """Unauthenticated requests are denied with 401; patients and unsupported roles are denied with 403."""
+        target_patient = self.create_patient('target_pat@example.com')
+        detail_url = self.detail_url(target_patient.id)
+
+        # 1. Unauthenticated (401)
+        self.client.logout()
+        res_anon_list = self.client.get(self.patient_list_url)
+        self.assertEqual(res_anon_list.status_code, status.HTTP_401_UNAUTHORIZED)
+        res_anon_detail = self.client.get(detail_url)
+        self.assertEqual(res_anon_detail.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        # 2. Patient (403)
+        self.client.force_authenticate(user=self.caller_patient)
+        res_pat_list = self.client.get(self.patient_list_url)
+        self.assertEqual(res_pat_list.status_code, status.HTTP_403_FORBIDDEN)
+        res_pat_detail = self.client.get(detail_url)
+        self.assertEqual(res_pat_detail.status_code, status.HTTP_403_FORBIDDEN)
+
+        # 3. Unsupported role (403)
+        self.client.force_authenticate(user=self.caller_nurse)
+        res_nurse_list = self.client.get(self.patient_list_url)
+        self.assertEqual(res_nurse_list.status_code, status.HTTP_403_FORBIDDEN)
+        res_nurse_detail = self.client.get(detail_url)
+        self.assertEqual(res_nurse_detail.status_code, status.HTTP_403_FORBIDDEN)
+
 
 
