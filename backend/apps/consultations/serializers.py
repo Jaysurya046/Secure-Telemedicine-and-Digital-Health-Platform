@@ -1,6 +1,9 @@
 """Serializers for consultations."""
+from collections.abc import Mapping
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
+from apps.appointments.models import Appointment
 from apps.users.serializers import DoctorListSerializer, PatientListSerializer
 from .models import Consultation, ConsultationMessage
 
@@ -29,6 +32,104 @@ class ConsultationSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['id', 'room_id', 'started_at', 'ended_at', 'created_at', 'updated_at']
+        extra_kwargs = {
+            'patient': {'required': False},
+            'doctor': {'required': False},
+        }
+
+    def to_internal_value(self, data):
+        if not isinstance(data, Mapping):
+            return super().to_internal_value(data)
+
+        if hasattr(data, 'copy'):
+            data = data.copy()
+        else:
+            data = dict(data)
+
+        # Apply creation security rules only when creating a new consultation
+        if self.instance is None:
+            raw_appointment = data.get('appointment')
+            if raw_appointment is None or str(raw_appointment).strip() == '':
+                raise serializers.ValidationError({
+                    'appointment': 'Confirmed appointment is required to create a consultation.'
+                })
+
+            raw_appointment_id = getattr(raw_appointment, 'id', raw_appointment)
+            try:
+                appointment = Appointment.objects.select_related('patient', 'doctor').get(id=raw_appointment_id)
+            except (Appointment.DoesNotExist, DjangoValidationError, ValueError, TypeError):
+                raise serializers.ValidationError({
+                    'appointment': 'Referenced appointment does not exist.'
+                })
+
+            # 1. Must be a confirmed appointment
+            if appointment.status != 'confirmed':
+                raise serializers.ValidationError({
+                    'appointment': f'Appointment must be confirmed (current status: {appointment.status}).'
+                })
+
+            # 2. Duplicate check
+            if Consultation.objects.filter(appointment=appointment).exists():
+                raise serializers.ValidationError({
+                    'appointment': 'A consultation already exists for this appointment.'
+                })
+
+            # 3. Caller authorization check
+            request = self.context.get('request')
+            user = getattr(request, 'user', None)
+
+            if not user or not user.is_authenticated:
+                raise serializers.ValidationError({
+                    'detail': 'Authentication credentials were not provided.'
+                })
+
+            if user.role == 'patient':
+                if appointment.patient_id != user.id:
+                    raise serializers.ValidationError({
+                        'appointment': 'Patients may only create consultations for their own appointments.'
+                    })
+            elif user.role == 'doctor':
+                if appointment.doctor_id != user.id:
+                    raise serializers.ValidationError({
+                        'appointment': 'Doctors may only create consultations for appointments assigned to them.'
+                    })
+            elif user.role == 'admin':
+                # Admins may create for any qualifying appointment
+                pass
+            else:
+                raise serializers.ValidationError({
+                    'detail': 'Your role is not permitted to create consultations.'
+                })
+
+            # 4. Status derivation & validation: initial status must be scheduled
+            if 'status' in data and data['status'] is not None and str(data['status']).strip() != '':
+                if str(data['status']).strip() != 'scheduled':
+                    raise serializers.ValidationError({
+                        'status': "Initial status must be 'scheduled'."
+                    })
+            data['status'] = 'scheduled'
+
+            # 5. Patient derivation & conflict check
+            if 'patient' in data and data['patient'] is not None and str(data['patient']).strip() != '':
+                raw_patient = data['patient']
+                raw_patient_id = getattr(raw_patient, 'id', raw_patient)
+                if str(raw_patient_id) != str(appointment.patient_id):
+                    raise serializers.ValidationError({
+                        'patient': 'Supplied patient conflicts with the appointment.'
+                    })
+            data['patient'] = appointment.patient_id
+
+            # 6. Doctor derivation & conflict check
+            if 'doctor' in data and data['doctor'] is not None and str(data['doctor']).strip() != '':
+                raw_doctor = data['doctor']
+                raw_doctor_id = getattr(raw_doctor, 'id', raw_doctor)
+                if str(raw_doctor_id) != str(appointment.doctor_id):
+                    raise serializers.ValidationError({
+                        'doctor': 'Supplied doctor conflicts with the appointment.'
+                    })
+            data['doctor'] = appointment.doctor_id
+
+        return super().to_internal_value(data)
 
     def validate_patient(self, value):
         if value.role != 'patient':
