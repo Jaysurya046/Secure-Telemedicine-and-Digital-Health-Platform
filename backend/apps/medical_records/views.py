@@ -6,22 +6,28 @@ from rest_framework.response import Response
 
 from .encryption import sha256_file
 from .models import MedicalDocument, MedicalRecord, Prescription
+from .permissions import ClinicalRecordPermission
 from .serializers import MedicalDocumentSerializer, MedicalRecordSerializer, PrescriptionSerializer
 
 
 class MedicalAccessMixin:
     def filter_for_user(self, queryset):
         user = self.request.user
-        if user.role == 'admin':
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        role = getattr(user, 'role', None)
+        if role == 'admin':
             return queryset
-        if user.role == 'doctor':
+        if role == 'doctor':
             return queryset.filter(doctor=user) if hasattr(queryset.model, 'doctor') else queryset.filter(uploaded_by=user)
-        return queryset.filter(patient=user)
+        if role == 'patient':
+            return queryset.filter(patient=user)
+        return queryset.none()
 
 
 class MedicalRecordViewSet(MedicalAccessMixin, viewsets.ModelViewSet):
     serializer_class = MedicalRecordSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, ClinicalRecordPermission]
     filterset_fields = ['patient', 'doctor', 'record_type', 'consultation']
     ordering_fields = ['created_at', 'updated_at']
     ordering = ['-created_at']
@@ -46,7 +52,7 @@ class MedicalRecordViewSet(MedicalAccessMixin, viewsets.ModelViewSet):
 
 class PrescriptionViewSet(MedicalAccessMixin, viewsets.ModelViewSet):
     serializer_class = PrescriptionSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, ClinicalRecordPermission]
     filterset_fields = ['patient', 'doctor', 'status', 'consultation']
     ordering_fields = ['created_at', 'valid_until']
     ordering = ['-created_at']
