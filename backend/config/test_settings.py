@@ -6,10 +6,12 @@ from .settings import *
 
 DEBUG = False
 
+import os
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+        'NAME': os.environ.get('TEST_DB_PATH', ':memory:'),
     }
 }
 
