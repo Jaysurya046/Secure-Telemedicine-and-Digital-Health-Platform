@@ -1166,6 +1166,98 @@ class ConsultationLifecycleTransitionTests(APITestCase):
         self.assertIsNone(self.consultation.ended_at)
         self.assertEqual(self.consultation.diagnosis, 'Initial observation')
 
+    def test_start_and_end_reject_explicit_json_empty_strings_and_null(self):
+        """start and end reject raw application/json bodies '\"\"' and 'null' with 400 without modifying state."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # 1. start with '""'
+        res_start_str = self.client.post(
+            self.start_url(self.consultation.id),
+            data='""',
+            content_type='application/json',
+        )
+        self.assertEqual(res_start_str.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'scheduled')
+        self.assertIsNone(self.consultation.started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+        self.assertEqual(self.consultation.clinical_notes, 'Awaiting examination')
+        self.assertFalse(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.follow_up_notes, 'Initial plan')
+
+        # 2. start with 'null'
+        res_start_null = self.client.post(
+            self.start_url(self.consultation.id),
+            data='null',
+            content_type='application/json',
+        )
+        self.assertEqual(res_start_null.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'scheduled')
+        self.assertIsNone(self.consultation.started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+        self.assertEqual(self.consultation.clinical_notes, 'Awaiting examination')
+        self.assertFalse(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.follow_up_notes, 'Initial plan')
+
+        # Advance consultation to in_progress to test end
+        fixed_started_at = timezone.now() - datetime.timedelta(minutes=10)
+        self.consultation.status = 'in_progress'
+        self.consultation.started_at = fixed_started_at
+        self.consultation.save()
+
+        # 3. end with '""'
+        res_end_str = self.client.post(
+            self.end_url(self.consultation.id),
+            data='""',
+            content_type='application/json',
+        )
+        self.assertEqual(res_end_str.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+        self.assertEqual(self.consultation.clinical_notes, 'Awaiting examination')
+        self.assertFalse(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.follow_up_notes, 'Initial plan')
+
+        # 4. end with 'null'
+        res_end_null = self.client.post(
+            self.end_url(self.consultation.id),
+            data='null',
+            content_type='application/json',
+        )
+        self.assertEqual(res_end_null.status_code, status.HTTP_400_BAD_REQUEST)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertEqual(self.consultation.started_at, fixed_started_at)
+        self.assertIsNone(self.consultation.ended_at)
+        self.assertEqual(self.consultation.diagnosis, 'Initial observation')
+        self.assertEqual(self.consultation.clinical_notes, 'Awaiting examination')
+        self.assertFalse(self.consultation.follow_up_required)
+        self.assertEqual(self.consultation.follow_up_notes, 'Initial plan')
+
+    def test_start_and_end_accept_bodyless_and_empty_dict(self):
+        """Genuinely bodyless requests and {} are accepted."""
+        self.client.force_authenticate(user=self.doctor)
+
+        # 1. Bodyless start
+        res_bodyless = self.client.post(self.start_url(self.consultation.id))
+        self.assertEqual(res_bodyless.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'in_progress')
+        self.assertIsNotNone(self.consultation.started_at)
+
+        # 2. Empty dict end
+        res_dict = self.client.post(self.end_url(self.consultation.id), data={}, format='json')
+        self.assertEqual(res_dict.status_code, status.HTTP_200_OK)
+        self.consultation.refresh_from_db()
+        self.assertEqual(self.consultation.status, 'completed')
+        self.assertIsNotNone(self.consultation.ended_at)
+
     # =========================================================================
     # 5. Role Permissions and Authorization (Feature 3E Rules Preserved)
     # =========================================================================

@@ -70,8 +70,7 @@ class ConsultationViewSet(viewsets.ModelViewSet):
         if request.user.role == 'doctor' and consultation.doctor_id != request.user.id:
             return Response({'error': 'Only the assigned doctor can start this consultation.'}, status=status.HTTP_403_FORBIDDEN)
 
-        payload = request.data if request.data not in ('', None) else {}
-        serializer = ConsultationStartSerializer(data=payload)
+        serializer = ConsultationStartSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
@@ -98,8 +97,7 @@ class ConsultationViewSet(viewsets.ModelViewSet):
         if request.user.role == 'doctor' and consultation.doctor_id != request.user.id:
             return Response({'error': 'Only the assigned doctor can end this consultation.'}, status=status.HTTP_403_FORBIDDEN)
 
-        payload = request.data if request.data not in ('', None) else {}
-        serializer = ConsultationEndSerializer(data=payload)
+        serializer = ConsultationEndSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         with transaction.atomic():
