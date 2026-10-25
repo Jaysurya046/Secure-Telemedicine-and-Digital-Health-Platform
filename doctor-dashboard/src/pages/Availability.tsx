@@ -233,7 +233,9 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
   }
 
   async function handleDelete(windowId: string) {
-    if (!confirm('Are you sure you want to delete this availability window?')) return;
+    if (typeof window !== 'undefined' && typeof window.confirm === 'function') {
+      if (!window.confirm('Are you sure you want to delete this availability window?')) return;
+    }
     setActionInProgress(windowId);
     setFeedbackError('');
     setFeedbackSuccess('');

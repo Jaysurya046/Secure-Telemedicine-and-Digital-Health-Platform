@@ -1,24 +1,68 @@
 import { JSDOM } from 'jsdom';
+import React from 'react';
 
 export function setupDom() {
+  if (globalThis.window && globalThis.document) {
+    return;
+  }
+
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
     url: 'http://localhost:3001',
     pretendToBeVisual: true
   });
 
-  globalThis.window = dom.window;
-  globalThis.document = dom.window.document;
-  globalThis.navigator = dom.window.navigator;
-  globalThis.localStorage = dom.window.localStorage;
-  globalThis.HTMLElement = dom.window.HTMLElement;
-  globalThis.Element = dom.window.Element;
-  globalThis.Node = dom.window.Node;
-  globalThis.Event = dom.window.Event;
-  globalThis.CustomEvent = dom.window.CustomEvent;
-  globalThis.Headers = dom.window.Headers || globalThis.Headers;
-  globalThis.Request = dom.window.Request || globalThis.Request;
-  globalThis.Response = dom.window.Response || globalThis.Response;
-  globalThis.FormData = dom.window.FormData || globalThis.FormData;
+  const keys = [
+    'window',
+    'document',
+    'localStorage',
+    'HTMLElement',
+    'HTMLInputElement',
+    'HTMLSelectElement',
+    'HTMLButtonElement',
+    'Element',
+    'Node',
+    'Event',
+    'CustomEvent',
+    'Headers',
+    'Request',
+    'Response',
+    'FormData',
+    'MutationObserver'
+  ];
+
+  for (const key of keys) {
+    if (dom.window[key]) {
+      Object.defineProperty(globalThis, key, {
+        value: dom.window[key],
+        configurable: true,
+        writable: true
+      });
+    }
+  }
+
+  Object.defineProperty(globalThis, 'navigator', {
+    value: dom.window.navigator,
+    configurable: true,
+    writable: true
+  });
+
+  Object.defineProperty(globalThis, 'self', {
+    value: dom.window,
+    configurable: true,
+    writable: true
+  });
+
+  dom.window.confirm = () => true;
+  dom.window.alert = () => {};
+  globalThis.React = React;
+  globalThis.confirm = () => true;
+  globalThis.alert = () => {};
+  globalThis.requestAnimationFrame = (callback) => setTimeout(callback, 0);
+  globalThis.cancelAnimationFrame = (id) => clearTimeout(id);
+  globalThis.requestIdleCallback = (callback) => setTimeout(callback, 1);
+  globalThis.cancelIdleCallback = (id) => clearTimeout(id);
 
   return dom;
 }
+
+setupDom();

@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
-    "test": "node --experimental-strip-types --test tests/appointments_workflow.test.mjs"
+    "test": "npx tsx --test tests/patient_component_workflow.test.tsx"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.51.11",
