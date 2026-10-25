@@ -3422,9 +3422,8 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
         from django.db import connection
         if connection.vendor != 'postgresql':
             self.skipTest(
-                f"PostgreSQL is unavailable in the current test environment (active engine is "
-                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
-                "PostgreSQL multi-threaded concurrency test skipped as instructed."
+                f"Active database vendor is '{connection.vendor}'. "
+                "Multi-threaded independent connection concurrency tests require PostgreSQL."
             )
 
         import threading
@@ -3433,7 +3432,7 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         results = []
         thread_exceptions = []
-        barrier = threading.Barrier(2, timeout=10.0)
+        barrier = threading.Barrier(2, timeout=5.0)
         target_start = self.FIXED_NOW + timedelta(days=3, hours=14)
         target_end = self.FIXED_NOW + timedelta(days=3, hours=15)
 
@@ -3442,18 +3441,17 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
                 client = APIClient()
                 client.force_authenticate(user=patient_user)
                 barrier.wait()
-                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
-                    res = client.post(
-                        self.list_url,
-                        {
-                            'doctor': str(self.doctor_1.id),
-                            'scheduled_start': target_start.isoformat(),
-                            'scheduled_end': target_end.isoformat(),
-                            'reason': 'Concurrent booking slot',
-                        },
-                        format='json',
-                    )
-                    results.append(res.status_code)
+                res = client.post(
+                    self.list_url,
+                    {
+                        'doctor': str(self.doctor_1.id),
+                        'scheduled_start': target_start.isoformat(),
+                        'scheduled_end': target_end.isoformat(),
+                        'reason': 'Concurrent booking slot',
+                    },
+                    format='json',
+                )
+                results.append(res.status_code)
             except Exception as exc:
                 thread_exceptions.append(exc)
             finally:
@@ -3461,10 +3459,15 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         t1 = threading.Thread(target=attempt_booking, args=(self.patient_1,))
         t2 = threading.Thread(target=attempt_booking, args=(self.patient_2,))
-        t1.start()
-        t2.start()
-        t1.join(timeout=15.0)
-        t2.join(timeout=15.0)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+        self.assertFalse(t1.is_alive(), "Worker thread 1 failed to terminate within timeout.")
+        self.assertFalse(t2.is_alive(), "Worker thread 2 failed to terminate within timeout.")
 
         if thread_exceptions:
             self.fail(f"Worker thread exception during concurrent booking: {thread_exceptions}")
@@ -3489,9 +3492,8 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
         from django.db import connection
         if connection.vendor != 'postgresql':
             self.skipTest(
-                f"PostgreSQL is unavailable in the current test environment (active engine is "
-                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
-                "PostgreSQL multi-threaded concurrency test skipped as instructed."
+                f"Active database vendor is '{connection.vendor}'. "
+                "Multi-threaded independent connection concurrency tests require PostgreSQL."
             )
 
         import threading
@@ -3510,7 +3512,7 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         results = []
         thread_exceptions = []
-        barrier = threading.Barrier(2, timeout=10.0)
+        barrier = threading.Barrier(2, timeout=5.0)
         target_start = self.FIXED_NOW + timedelta(days=4, hours=10)
         target_end = self.FIXED_NOW + timedelta(days=4, hours=11)
 
@@ -3519,16 +3521,15 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
                 client = APIClient()
                 client.force_authenticate(user=patient_user)
                 barrier.wait()
-                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
-                    res = client.patch(
-                        self.detail_url(appt_id),
-                        {
-                            'scheduled_start': target_start.isoformat(),
-                            'scheduled_end': target_end.isoformat(),
-                        },
-                        format='json',
-                    )
-                    results.append(res.status_code)
+                res = client.patch(
+                    self.detail_url(appt_id),
+                    {
+                        'scheduled_start': target_start.isoformat(),
+                        'scheduled_end': target_end.isoformat(),
+                    },
+                    format='json',
+                )
+                results.append(res.status_code)
             except Exception as exc:
                 thread_exceptions.append(exc)
             finally:
@@ -3536,10 +3537,15 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         t1 = threading.Thread(target=attempt_reschedule, args=(self.appointment_1.id, self.patient_1))
         t2 = threading.Thread(target=attempt_reschedule, args=(appt_extra.id, self.patient_2))
-        t1.start()
-        t2.start()
-        t1.join(timeout=15.0)
-        t2.join(timeout=15.0)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+        self.assertFalse(t1.is_alive(), "Worker thread 1 failed to terminate within timeout.")
+        self.assertFalse(t2.is_alive(), "Worker thread 2 failed to terminate within timeout.")
 
         if thread_exceptions:
             self.fail(f"Worker thread exception during concurrent rescheduling: {thread_exceptions}")
@@ -3567,9 +3573,8 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
         from django.db import connection
         if connection.vendor != 'postgresql':
             self.skipTest(
-                f"PostgreSQL is unavailable in the current test environment (active engine is "
-                f"'{connection.vendor}', and port 5432 PostgreSQL server is offline). "
-                "PostgreSQL multi-threaded concurrency test skipped as instructed."
+                f"Active database vendor is '{connection.vendor}'. "
+                "Multi-threaded independent connection concurrency tests require PostgreSQL."
             )
 
         import threading
@@ -3578,7 +3583,7 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         results = {}
         thread_exceptions = []
-        barrier = threading.Barrier(2, timeout=10.0)
+        barrier = threading.Barrier(2, timeout=5.0)
         new_start = self.FIXED_NOW + timedelta(days=5, hours=14)
         new_end = self.FIXED_NOW + timedelta(days=5, hours=15)
 
@@ -3587,16 +3592,15 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
                 client = APIClient()
                 client.force_authenticate(user=self.patient_1)
                 barrier.wait()
-                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
-                    res = client.patch(
-                        self.detail_url(self.appointment_1.id),
-                        {
-                            'scheduled_start': new_start.isoformat(),
-                            'scheduled_end': new_end.isoformat(),
-                        },
-                        format='json',
-                    )
-                    results['reschedule'] = res.status_code
+                res = client.patch(
+                    self.detail_url(self.appointment_1.id),
+                    {
+                        'scheduled_start': new_start.isoformat(),
+                        'scheduled_end': new_end.isoformat(),
+                    },
+                    format='json',
+                )
+                results['reschedule'] = res.status_code
             except Exception as exc:
                 thread_exceptions.append(exc)
             finally:
@@ -3607,13 +3611,12 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
                 client = APIClient()
                 client.force_authenticate(user=self.doctor_1)
                 barrier.wait()
-                with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
-                    res = client.post(
-                        self.confirm_url(self.appointment_1.id),
-                        {},
-                        format='json',
-                    )
-                    results['confirm'] = res.status_code
+                res = client.post(
+                    self.confirm_url(self.appointment_1.id),
+                    {},
+                    format='json',
+                )
+                results['confirm'] = res.status_code
             except Exception as exc:
                 thread_exceptions.append(exc)
             finally:
@@ -3621,18 +3624,21 @@ class AppointmentConcurrencyAndLifecycleCoordinationTests(BaseAppointmentTransac
 
         t1 = threading.Thread(target=attempt_reschedule)
         t2 = threading.Thread(target=attempt_confirm)
-        t1.start()
-        t2.start()
-        t1.join(timeout=15.0)
-        t2.join(timeout=15.0)
+
+        with patch('django.utils.timezone.now', return_value=self.FIXED_NOW):
+            t1.start()
+            t2.start()
+            t1.join(timeout=10.0)
+            t2.join(timeout=10.0)
+
+        self.assertFalse(t1.is_alive(), "Worker thread 1 failed to terminate within timeout.")
+        self.assertFalse(t2.is_alive(), "Worker thread 2 failed to terminate within timeout.")
 
         if thread_exceptions:
             self.fail(f"Worker thread exception during reschedule vs confirm: {thread_exceptions}")
 
         self.appointment_1.refresh_from_db()
         self.assertEqual(self.appointment_1.status, 'confirmed')
-        # Either reschedule succeeded then confirm succeeded (both 200/OK),
-        # or confirm succeeded (200) and reschedule was rejected (400) because appointment was already confirmed
         self.assertEqual(results['confirm'], status.HTTP_200_OK)
         self.assertIn(results['reschedule'], [status.HTTP_200_OK, status.HTTP_400_BAD_REQUEST])
 

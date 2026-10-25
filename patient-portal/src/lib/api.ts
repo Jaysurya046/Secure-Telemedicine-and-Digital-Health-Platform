@@ -5,14 +5,43 @@ export type AuthPayload = {
   password: string;
 };
 
+export class ApiError extends Error {
+  status: number;
+  body: any;
+  details?: any;
+
+  constructor(message: string, status: number, body: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+    this.details = body?.details || (typeof body === 'object' ? body : undefined);
+  }
+}
+
+export function isInvalidPageError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const apiErr = err as ApiError;
+  if (apiErr.status !== 404) return false;
+  const detail = apiErr.body?.detail || apiErr.body?.message || apiErr.message || '';
+  return /invalid page/i.test(String(detail));
+}
+
 export function getAccessToken() {
   if (typeof window === 'undefined') return '';
   return localStorage.getItem('accessToken') || '';
 }
 
 export function setTokens(tokens: { access: string; refresh: string }) {
+  if (typeof window === 'undefined') return;
   localStorage.setItem('accessToken', tokens.access);
   localStorage.setItem('refreshToken', tokens.refresh);
+}
+
+export function clearTokens() {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem('accessToken');
+  localStorage.removeItem('refreshToken');
 }
 
 export function formatErrorMessage(body: any): string {
@@ -68,7 +97,7 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
   }
 
   if (!response.ok) {
-    throw new Error(formatErrorMessage(body));
+    throw new ApiError(formatErrorMessage(body), response.status, body);
   }
   return body as T;
 }

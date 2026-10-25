@@ -3,6 +3,28 @@ const API_URL =
     ? import.meta.env.VITE_API_URL
     : 'http://localhost:8000';
 
+export class ApiError extends Error {
+  status: number;
+  body: any;
+  details?: any;
+
+  constructor(message: string, status: number, body: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+    this.details = body?.details || (typeof body === 'object' ? body : undefined);
+  }
+}
+
+export function isInvalidPageError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const apiErr = err as ApiError;
+  if (apiErr.status !== 404) return false;
+  const detail = apiErr.body?.detail || apiErr.body?.message || apiErr.message || '';
+  return /invalid page/i.test(String(detail));
+}
+
 export function getToken() {
   if (typeof localStorage === 'undefined') return '';
   return localStorage.getItem('doctorAccessToken') || '';
@@ -63,7 +85,7 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
     }
   }
   if (!response.ok) {
-    throw new Error(formatErrorMessage(body));
+    throw new ApiError(formatErrorMessage(body), response.status, body);
   }
   return body as T;
 }

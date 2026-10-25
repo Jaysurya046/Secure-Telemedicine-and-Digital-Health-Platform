@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import type { FormEvent } from 'react';
 import {
   CalendarPlus,
@@ -16,7 +16,7 @@ import {
   X
 } from 'lucide-react';
 import { AppNav } from '@/components/AppNav';
-import { apiFetch, toIsoTimestamp } from '@/lib/api';
+import { apiFetch, toIsoTimestamp, isInvalidPageError } from '@/lib/api';
 
 const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
 
@@ -75,6 +75,7 @@ export default function AppointmentsPage() {
   const [totalCount, setTotalCount] = useState<number>(0);
   const [hasNextPage, setHasNextPage] = useState<boolean>(false);
   const [hasPrevPage, setHasPrevPage] = useState<boolean>(false);
+  const appointmentsReqIdRef = useRef<number>(0);
 
   // Booking Form State
   const [bookForm, setBookForm] = useState({
@@ -182,10 +183,13 @@ export default function AppointmentsPage() {
   }
 
   async function loadAppointments(pageNumber: number = 1) {
+    const reqId = ++appointmentsReqIdRef.current;
     setLoadingAppointments(true);
     setAppointmentsError('');
     try {
       const data = await apiFetch<any>(`/api/appointments/?page=${pageNumber}`);
+      if (reqId !== appointmentsReqIdRef.current) return;
+
       if (Array.isArray(data)) {
         setAppointments(data);
         setTotalCount(data.length);
@@ -208,10 +212,16 @@ export default function AppointmentsPage() {
         setPage(pageNumber);
       }
     } catch (err: any) {
+      if (reqId !== appointmentsReqIdRef.current) return;
+      if (isInvalidPageError(err) && pageNumber > 1) {
+        return loadAppointments(pageNumber - 1);
+      }
       setAppointments([]);
       setAppointmentsError(err.message || 'Failed to load appointments.');
     } finally {
-      setLoadingAppointments(false);
+      if (reqId === appointmentsReqIdRef.current) {
+        setLoadingAppointments(false);
+      }
     }
   }
 
@@ -627,7 +637,7 @@ export default function AppointmentsPage() {
               {(hasPrevPage || hasNextPage || totalCount > 10) && (
                 <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-4 text-xs font-semibold text-slate-600">
                   <button
-                    disabled={!hasPrevPage && page <= 1}
+                    disabled={!hasPrevPage || page <= 1}
                     onClick={() => loadAppointments(page - 1)}
                     className="flex items-center gap-1 rounded border border-slate-200 px-3 py-1.5 disabled:opacity-40"
                   >

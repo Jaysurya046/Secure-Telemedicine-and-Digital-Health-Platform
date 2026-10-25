@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { FormEvent } from 'react';
 import {
   CalendarCheck,
@@ -13,7 +13,7 @@ import {
   Filter,
   User
 } from 'lucide-react';
-import { apiFetch } from '../services/api';
+import { apiFetch, isInvalidPageError } from '../services/api';
 
 type StatusFilter = 'all' | 'pending' | 'confirmed' | 'completed' | 'cancelled';
 
@@ -54,6 +54,7 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
   const [feedbackSuccess, setFeedbackSuccess] = useState<string>('');
   const [feedbackError, setFeedbackError] = useState<string>('');
+  const activeReqIdRef = useRef<number>(0);
 
   // Cancel modal
   const [cancellingAppointment, setCancellingAppointment] = useState<Appointment | null>(null);
@@ -64,6 +65,7 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
   }, [statusFilter]);
 
   async function loadAppointments(pageNumber: number = page, currentFilter: StatusFilter = statusFilter) {
+    const reqId = ++activeReqIdRef.current;
     setLoading(true);
     setLoadingError('');
     try {
@@ -72,6 +74,8 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
         url += `&status=${currentFilter}`;
       }
       const data = await apiFetch<any>(url);
+      if (reqId !== activeReqIdRef.current) return;
+
       if (Array.isArray(data)) {
         setAppointments(data);
         setTotalCount(data.length);
@@ -94,10 +98,16 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
         setPage(pageNumber);
       }
     } catch (err: any) {
+      if (reqId !== activeReqIdRef.current) return;
+      if (isInvalidPageError(err) && pageNumber > 1) {
+        return loadAppointments(pageNumber - 1, currentFilter);
+      }
       setLoadingError(err.message || 'Failed to load appointments.');
       setAppointments([]);
     } finally {
-      setLoading(false);
+      if (reqId === activeReqIdRef.current) {
+        setLoading(false);
+      }
     }
   }
 
@@ -356,7 +366,7 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
             <div className="panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.8rem 1rem' }}>
               <button
                 className="icon-button"
-                disabled={!hasPrevPage && page <= 1}
+                disabled={!hasPrevPage || page <= 1}
                 onClick={() => loadAppointments(page - 1, statusFilter)}
                 style={{ fontSize: '0.85rem' }}
               >

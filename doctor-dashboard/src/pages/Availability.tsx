@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import type { FormEvent } from 'react';
 import {
   Clock,
@@ -13,7 +13,7 @@ import {
   ChevronLeft,
   ChevronRight
 } from 'lucide-react';
-import { apiFetch } from '../services/api';
+import { apiFetch, isInvalidPageError } from '../services/api';
 
 const WEEKDAYS = [
   'Monday',
@@ -73,17 +73,32 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
 
   // Delete Action In Progress
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
+  const activeReqIdRef = useRef<number>(0);
 
   useEffect(() => {
-    loadAvailability(1);
+    loadAvailability(1, filterActive);
   }, []);
 
-  async function loadAvailability(pageNumber: number = page) {
+  async function loadAvailability(
+    pageNumber: number = page,
+    currentFilter: 'all' | 'active' | 'inactive' = filterActive
+  ) {
+    const reqId = ++activeReqIdRef.current;
     setLoading(true);
     setLoadingError('');
     try {
       // Backend DoctorAvailabilityViewSet is registered at /api/appointments/availability/
-      const data = await apiFetch<any>(`/api/appointments/availability/?page=${pageNumber}`);
+      // Server-side filtering by is_active is applied before pagination
+      let url = `/api/appointments/availability/?page=${pageNumber}`;
+      if (currentFilter === 'active') {
+        url += '&is_active=true';
+      } else if (currentFilter === 'inactive') {
+        url += '&is_active=false';
+      }
+
+      const data = await apiFetch<any>(url);
+      if (reqId !== activeReqIdRef.current) return;
+
       if (Array.isArray(data)) {
         setWindows(data);
         setTotalCount(data.length);
@@ -96,7 +111,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
 
         // Handle the last item disappearing from a filtered/subsequent page
         if (results.length === 0 && pageNumber > 1) {
-          return loadAvailability(pageNumber - 1);
+          return loadAvailability(pageNumber - 1, currentFilter);
         }
 
         setWindows(results);
@@ -106,11 +121,23 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
         setPage(pageNumber);
       }
     } catch (err: any) {
+      if (reqId !== activeReqIdRef.current) return;
+      if (isInvalidPageError(err) && pageNumber > 1) {
+        return loadAvailability(pageNumber - 1, currentFilter);
+      }
       setLoadingError(err.message || 'Failed to load availability windows.');
       setWindows([]);
     } finally {
-      setLoading(false);
+      if (reqId === activeReqIdRef.current) {
+        setLoading(false);
+      }
     }
+  }
+
+  function handleFilterChange(mode: 'all' | 'active' | 'inactive') {
+    setFilterActive(mode);
+    setPage(1);
+    loadAvailability(1, mode);
   }
 
   async function handleCreateSubmit(event: FormEvent) {
@@ -141,7 +168,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
       setFeedbackSuccess('Availability window created successfully.');
       setShowCreateForm(false);
       setCreateForm({ weekday: 0, start_time: '09:00', end_time: '17:00', is_active: true });
-      await loadAvailability(page);
+      await loadAvailability(page, filterActive);
       if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setCreateError(err.message || 'Failed to create availability window.');
@@ -177,7 +204,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
 
       setFeedbackSuccess('Availability window updated successfully.');
       setEditingWindow(null);
-      await loadAvailability(page);
+      await loadAvailability(page, filterActive);
       if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setEditError(err.message || 'Failed to update availability window.');
@@ -196,7 +223,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
         body: JSON.stringify({ is_active: !windowItem.is_active })
       });
       setFeedbackSuccess(`Window set to ${!windowItem.is_active ? 'Active' : 'Inactive'}.`);
-      await loadAvailability(page);
+      await loadAvailability(page, filterActive);
       if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to update window status.');
@@ -215,7 +242,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
         method: 'DELETE'
       });
       setFeedbackSuccess('Availability window deleted.');
-      await loadAvailability(page);
+      await loadAvailability(page, filterActive);
       if (onRefreshDashboard) await onRefreshDashboard();
     } catch (err: any) {
       setFeedbackError(err.message || 'Failed to delete availability window.');
@@ -223,12 +250,6 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
       setActionInProgress(null);
     }
   }
-
-  const displayedWindows = windows.filter((w) => {
-    if (filterActive === 'active') return w.is_active;
-    if (filterActive === 'inactive') return !w.is_active;
-    return true;
-  });
 
   return (
     <section className="stack">
@@ -241,7 +262,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
               Doctor Availability Management
             </h2>
             <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.2rem' }}>
-              <span className="muted">{totalCount} total windows ({windows.filter(w => w.is_active).length} active on page)</span>
+              <span className="muted">{totalCount} total window{totalCount === 1 ? '' : 's'} matching filter</span>
               <span style={{ fontSize: '0.75rem', fontWeight: 700, background: '#f1f5f9', color: '#475569', padding: '0.15rem 0.5rem', borderRadius: '4px' }}>
                 Timezone: UTC
               </span>
@@ -253,18 +274,18 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
               <Plus size={16} />
               {showCreateForm ? 'Cancel New Window' : 'Add Availability Window'}
             </button>
-            <button className="icon-button" onClick={() => loadAvailability(page)} disabled={loading} title="Refresh windows">
+            <button className="icon-button" onClick={() => loadAvailability(page, filterActive)} disabled={loading} title="Refresh windows">
               <RefreshCw size={16} className={loading ? 'animate-spin' : ''} />
             </button>
           </div>
         </div>
 
-        {/* Filter controls */}
+        {/* Server-side Filter controls */}
         <div style={{ display: 'flex', gap: '0.5rem', marginTop: '1rem', borderTop: '1px solid #e2e8f0', paddingTop: '0.75rem' }}>
           {(['all', 'active', 'inactive'] as const).map((mode) => (
             <button
               key={mode}
-              onClick={() => setFilterActive(mode)}
+              onClick={() => handleFilterChange(mode)}
               style={{
                 padding: '0.35rem 0.75rem',
                 borderRadius: '6px',
@@ -376,11 +397,11 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
         <div className="panel" style={{ textAlign: 'center', padding: '2rem', border: '1px solid #fecdd3', background: '#fff1f2' }}>
           <AlertCircle size={32} color="#be123c" style={{ margin: '0 auto 0.5rem' }} />
           <p style={{ fontWeight: 700, color: '#be123c', margin: '0.5rem 0' }}>{loadingError}</p>
-          <button className="primary" onClick={() => loadAvailability(page)} style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>
+          <button className="primary" onClick={() => loadAvailability(page, filterActive)} style={{ marginTop: '0.5rem', fontSize: '0.85rem' }}>
             <RefreshCw size={14} /> Retry Loading
           </button>
         </div>
-      ) : displayedWindows.length === 0 ? (
+      ) : windows.length === 0 ? (
         <div className="panel" style={{ textAlign: 'center', padding: '3rem' }}>
           <Clock size={36} color="#94a3b8" style={{ margin: '0 auto 0.5rem' }} />
           <p style={{ fontWeight: 700, margin: '0.5rem 0 0.2rem' }}>No availability windows found</p>
@@ -388,7 +409,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
         </div>
       ) : (
         <div className="stack">
-          {displayedWindows.map((item) => (
+          {windows.map((item) => (
             <article
               key={item.id}
               className="panel"
@@ -472,8 +493,8 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
             <div className="panel" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.8rem 1rem' }}>
               <button
                 className="icon-button"
-                disabled={!hasPrevPage && page <= 1}
-                onClick={() => loadAvailability(page - 1)}
+                disabled={!hasPrevPage || page <= 1}
+                onClick={() => loadAvailability(page - 1, filterActive)}
                 style={{ fontSize: '0.85rem' }}
               >
                 <ChevronLeft size={16} /> Previous
@@ -484,7 +505,7 @@ export function Availability({ onRefreshDashboard }: { onRefreshDashboard?: () =
               <button
                 className="icon-button"
                 disabled={!hasNextPage}
-                onClick={() => loadAvailability(page + 1)}
+                onClick={() => loadAvailability(page + 1, filterActive)}
                 style={{ fontSize: '0.85rem' }}
               >
                 Next <ChevronRight size={16} />
