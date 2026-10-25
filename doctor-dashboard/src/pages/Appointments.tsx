@@ -11,7 +11,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Filter,
-  User
+  User,
+  Video
 } from 'lucide-react';
 import { apiFetch, isInvalidPageError } from '../services/api';
 
@@ -41,7 +42,7 @@ type Appointment = {
   created_at: string;
 };
 
-export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () => Promise<void> | void }) {
+export function Appointments({ onRefreshDashboard, onOpenConsultation }: { onRefreshDashboard?: () => Promise<void> | void; onOpenConsultation?: (appointmentId: string) => void }) {
   const [appointments, setAppointments] = useState<Appointment[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [loadingError, setLoadingError] = useState<string>('');
@@ -331,16 +332,30 @@ export function Appointments({ onRefreshDashboard }: { onRefreshDashboard?: () =
                   </button>
                 )}
 
+                {appt.status === 'completed' && <button type="button" onClick={() => onOpenConsultation?.(appt.id)}>Open Consultation</button>}
                 {appt.status === 'confirmed' && (
-                  <button
-                    className="primary"
-                    style={{ background: '#0284c7', fontSize: '0.8rem', minHeight: '2.2rem', padding: '0.4rem 0.8rem' }}
-                    disabled={actionInProgress === appt.id}
-                    onClick={() => handleComplete(appt.id)}
-                  >
-                    <Check size={14} />
-                    {actionInProgress === appt.id ? 'Completing...' : 'Mark Complete'}
-                  </button>
+                  <>
+                    <button
+                      id={`btn-open-consultation-${appt.id}`}
+                      className="primary"
+                      style={{ background: '#7c3aed', fontSize: '0.8rem', minHeight: '2.2rem', padding: '0.4rem 0.8rem' }}
+                      disabled={actionInProgress === appt.id}
+                      onClick={() => onOpenConsultation?.(appt.id)}
+                      title="Open or create consultation for this appointment"
+                    >
+                      <Video size={14} />
+                      Open Consultation
+                    </button>
+                    <button
+                      className="primary"
+                      style={{ background: '#0284c7', fontSize: '0.8rem', minHeight: '2.2rem', padding: '0.4rem 0.8rem' }}
+                      disabled={actionInProgress === appt.id}
+                      onClick={() => handleComplete(appt.id)}
+                    >
+                      <Check size={14} />
+                      {actionInProgress === appt.id ? 'Completing...' : 'Mark Complete'}
+                    </button>
+                  </>
                 )}
 
                 {(appt.status === 'pending' || appt.status === 'confirmed') && (

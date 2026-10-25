@@ -170,9 +170,12 @@ def run_upgrade_verification_script(db_path: str):
         chief_complaint='Cough and shortness of breath'
     )
 
-    ConsultationMessage.objects.create(
-        consultation=consult,
-        sender=patient_user,
+    # Seed with the historical model: current message fields do not exist at 0001.
+    from django.db.migrations.executor import MigrationExecutor
+    initial_apps = MigrationExecutor(connection).loader.project_state([('consultations', '0001_initial')]).apps
+    initial_apps.get_model('consultations', 'ConsultationMessage').objects.create(
+        consultation_id=consult.id,
+        sender_id=patient_user.id,
         message='Hello doctor, having breathing difficulties.'
     )
 

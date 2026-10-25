@@ -1,33 +1,37 @@
 import { registerChatHandlers } from '../chat/service.js';
 import { registerWebRtcSignaling } from '../webrtc/signaling.js';
+import { authorize, deliver, handle, validRoom } from '../auth/rooms.js';
 
 export function registerSocketHandlers(io) {
   io.on('connection', (socket) => {
-    socket.emit('connected', {
-      socketId: socket.id,
-      user: socket.user,
-      connectedAt: new Date().toISOString(),
+    socket.emit('connected', { socketId: socket.id, user: socket.user });
+    handle(socket, 'consultation:join', 'error', async ({ roomId }, reject) => {
+      if (!validRoom(roomId)) return reject('INVALID_PAYLOAD', 'roomId is required.');
+      const room = await authorize(socket, roomId);
+      if (!room) return reject('UNAUTHORIZED', 'Not authorized for this room.');
+      if (!socket.connected) return;
+      await socket.join(roomId);
+      socket.emit('consultation:joined', { roomId, consultationId: room.consultationId, status: room.status });
+      await deliver(io, roomId, 'consultation:participant-joined', { user: socket.user }, socket.id);
     });
-
-    socket.on('consultation:join', ({ roomId }) => {
-      if (!roomId) {
-        socket.emit('error', { message: 'roomId is required' });
-        return;
+    handle(socket, 'consultation:leave', 'error', async ({ roomId }, reject) => {
+      if (!validRoom(roomId)) return reject('INVALID_PAYLOAD', 'roomId is required.');
+      if (!socket.rooms.has(roomId)) return;
+      if (await authorize(socket, roomId)) await deliver(io, roomId, 'consultation:participant-left', { user: socket.user }, socket.id);
+      await socket.leave(roomId);
+    });
+    handle(socket, 'presence:update', 'error', async ({ status }, reject) => {
+      if (!['online', 'away', 'busy'].includes(status)) return reject('INVALID_PAYLOAD', 'Invalid presence status.');
+      for (const roomId of socket.rooms) {
+        if (roomId !== socket.id && await authorize(socket, roomId))
+          await deliver(io, roomId, 'presence:update', { user: socket.user, status, at: new Date().toISOString() }, socket.id);
       }
-      socket.join(roomId);
-      socket.to(roomId).emit('consultation:participant-joined', { user: socket.user });
-      socket.emit('consultation:joined', { roomId });
     });
-
-    socket.on('consultation:leave', ({ roomId }) => {
-      socket.leave(roomId);
-      socket.to(roomId).emit('consultation:participant-left', { user: socket.user });
+    socket.on('disconnecting', () => {
+      for (const roomId of socket.rooms) {
+        if (roomId !== socket.id) deliver(io, roomId, 'consultation:participant-left', { user: socket.user }, socket.id).catch(() => {});
+      }
     });
-
-    socket.on('presence:update', ({ status }) => {
-      socket.broadcast.emit('presence:update', { user: socket.user, status, at: new Date().toISOString() });
-    });
-
     registerChatHandlers(socket, io);
     registerWebRtcSignaling(socket, io);
   });

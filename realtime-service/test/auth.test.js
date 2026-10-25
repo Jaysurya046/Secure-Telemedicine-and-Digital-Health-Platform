@@ -1,136 +1,29 @@
-import { describe, it, beforeEach } from 'node:test';
-import assert from 'node:assert';
+import { test, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
 import jwt from 'jsonwebtoken';
 import { authenticateSocket, getJwtSecret } from '../src/auth/middleware.js';
-
-describe('Realtime Auth Middleware & JWT Resolution', () => {
-  const origEnv = { ...process.env };
-
-  beforeEach(() => {
-    process.env = { ...origEnv };
-    delete process.env.JWT_SECRET_KEY;
-    delete process.env.DJANGO_SECRET_KEY;
-  });
-
-  describe('getJwtSecret() resolution policy', () => {
-    it('uses JWT_SECRET_KEY when provided and non-empty', () => {
-      process.env.JWT_SECRET_KEY = 'test-jwt-secret-123';
-      process.env.DJANGO_SECRET_KEY = 'test-django-secret-456';
-      assert.strictEqual(getJwtSecret(), 'test-jwt-secret-123');
-    });
-
-    it('falls back to DJANGO_SECRET_KEY when JWT_SECRET_KEY is empty or blank', () => {
-      process.env.JWT_SECRET_KEY = '   ';
-      process.env.DJANGO_SECRET_KEY = 'test-django-fallback-secret';
-      assert.strictEqual(getJwtSecret(), 'test-django-fallback-secret');
-    });
-
-    it('falls back to DJANGO_SECRET_KEY when JWT_SECRET_KEY is undefined', () => {
-      delete process.env.JWT_SECRET_KEY;
-      process.env.DJANGO_SECRET_KEY = 'test-django-fallback-secret';
-      assert.strictEqual(getJwtSecret(), 'test-django-fallback-secret');
-    });
-
-    it('falls back to default insecure key when both secrets are blank or undefined', () => {
-      delete process.env.JWT_SECRET_KEY;
-      delete process.env.DJANGO_SECRET_KEY;
-      assert.strictEqual(getJwtSecret(), 'django-insecure-change-this-in-production');
-
-      process.env.JWT_SECRET_KEY = '';
-      process.env.DJANGO_SECRET_KEY = '  ';
-      assert.strictEqual(getJwtSecret(), 'django-insecure-change-this-in-production');
-    });
-  });
-
-  describe('authenticateSocket() token verification', () => {
-    it('successfully verifies token signed with effective JWT_SECRET_KEY', (t, done) => {
-      process.env.JWT_SECRET_KEY = 'synthetic-jwt-key-abc';
-      process.env.DJANGO_SECRET_KEY = 'synthetic-django-key-def';
-
-      const token = jwt.sign(
-        { user_id: 'user-uuid-1', role: 'patient', email: 'patient@example.com' },
-        'synthetic-jwt-key-abc',
-        { algorithm: 'HS256' }
-      );
-
-      const fakeSocket = {
-        handshake: {
-          auth: { token },
-          headers: {}
-        }
-      };
-
-      authenticateSocket(fakeSocket, (err) => {
-        assert.ifError(err);
-        assert.strictEqual(fakeSocket.user.id, 'user-uuid-1');
-        assert.strictEqual(fakeSocket.user.role, 'patient');
-        assert.strictEqual(fakeSocket.user.email, 'patient@example.com');
-        done();
-      });
-    });
-
-    it('successfully verifies token using DJANGO_SECRET_KEY when JWT_SECRET_KEY is blank', (t, done) => {
-      delete process.env.JWT_SECRET_KEY;
-      process.env.DJANGO_SECRET_KEY = 'synthetic-django-shared-key';
-
-      const token = jwt.sign(
-        { user_id: 'doctor-uuid-2', role: 'doctor', email: 'doctor@example.com' },
-        'synthetic-django-shared-key',
-        { algorithm: 'HS256' }
-      );
-
-      const fakeSocket = {
-        handshake: {
-          auth: { token },
-          headers: {}
-        }
-      };
-
-      authenticateSocket(fakeSocket, (err) => {
-        assert.ifError(err);
-        assert.strictEqual(fakeSocket.user.id, 'doctor-uuid-2');
-        assert.strictEqual(fakeSocket.user.role, 'doctor');
-        done();
-      });
-    });
-
-    it('rejects token signed with a different key', (t, done) => {
-      process.env.JWT_SECRET_KEY = 'configured-jwt-key';
-
-      const token = jwt.sign(
-        { user_id: 'user-uuid-3', role: 'patient', email: 'attacker@example.com' },
-        'different-unauthorized-key',
-        { algorithm: 'HS256' }
-      );
-
-      const fakeSocket = {
-        handshake: {
-          auth: { token },
-          headers: {}
-        }
-      };
-
-      authenticateSocket(fakeSocket, (err) => {
-        assert.ok(err instanceof Error);
-        assert.strictEqual(err.message, 'Unauthorized socket connection');
-        done();
-      });
-    });
-
-    it('permits guest connection when token is absent', (t, done) => {
-      const fakeSocket = {
-        handshake: {
-          auth: {},
-          headers: {}
-        }
-      };
-
-      authenticateSocket(fakeSocket, (err) => {
-        assert.ifError(err);
-        assert.strictEqual(fakeSocket.user.id, 'anonymous');
-        assert.strictEqual(fakeSocket.user.role, 'guest');
-        done();
-      });
-    });
-  });
+const originalFetch = globalThis.fetch;
+const originalEnv = { ...process.env };
+afterEach(() => { globalThis.fetch = originalFetch; process.env = { ...originalEnv }; });
+test('signing secret follows trimmed JWT, Django, fallback priority', () => {
+  process.env.JWT_SECRET_KEY = ' jwt '; process.env.DJANGO_SECRET_KEY = ' django ';
+  assert.equal(getJwtSecret(), 'jwt'); process.env.JWT_SECRET_KEY = ' ';
+  assert.equal(getJwtSecret(), 'django'); delete process.env.DJANGO_SECRET_KEY;
+  assert.equal(getJwtSecret(), 'django-insecure-change-this-in-production');
+});
+test('identity uses current Django role and email instead of JWT claims', async () => {
+  process.env.JWT_SECRET_KEY = 'synthetic-long-enough-key-for-testing';
+  const token = jwt.sign({ user_id: 'user1', role: 'admin', token_type: 'access' }, getJwtSecret(), { expiresIn: 60 });
+  globalThis.fetch = async () => new Response(JSON.stringify({ id: 'user1', role: 'patient', email: 'current@test.com' }));
+  const socket = { handshake: { auth: { token } }, once() {}, disconnect() {} };
+  await authenticateSocket(socket, error => assert.ifError(error));
+  assert.equal(socket.user.role, 'patient'); assert.equal(socket.user.email, 'current@test.com');
+});
+test('identity outage, unsupported roles and mismatched identities fail closed', async () => {
+  process.env.JWT_SECRET_KEY = 'synthetic-long-enough-key-for-testing';
+  const token = jwt.sign({ user_id: 'user1', token_type: 'access' }, getJwtSecret(), { expiresIn: 60 });
+  for (const response of [null, { id: 'user1', role: 'nurse' }, { id: 'different', role: 'patient' }]) {
+    globalThis.fetch = async () => { if (!response) throw new Error('offline'); return new Response(JSON.stringify(response)); };
+    await authenticateSocket({ handshake: { auth: { token } } }, error => assert.match(error.message, /Authentication required/));
+  }
 });

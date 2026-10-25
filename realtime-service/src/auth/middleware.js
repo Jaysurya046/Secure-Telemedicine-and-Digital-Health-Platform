@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import { fetchIdentity } from './django_client.js';
 
 /**
  * Resolves the effective JWT secret following the unified configuration policy:
@@ -14,23 +15,30 @@ export function getJwtSecret() {
   return 'django-insecure-change-this-in-production';
 }
 
-export function authenticateSocket(socket, next) {
-  const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
+export function getUserToken(socket) {
+  const auth = socket.handshake.auth?.token;
+  const header = socket.handshake.headers?.authorization;
+  return typeof auth === 'string' && auth ? auth :
+    (typeof header === 'string' ? header.replace(/^Bearer\s+/i, '') : '');
+}
 
-  if (!token) {
-    socket.user = { id: 'anonymous', role: 'guest', email: 'guest@local' };
-    return next();
-  }
-
+export async function authenticateSocket(socket, next) {
   try {
-    const decoded = jwt.verify(token, getJwtSecret(), { algorithms: ['HS256'] });
-    socket.user = {
-      id: decoded.user_id || decoded.sub,
-      role: decoded.role || 'user',
-      email: decoded.email || '',
-    };
-    return next();
+    const token = getUserToken(socket);
+    if (!token) throw new Error('no token provided');
+    const claims = jwt.verify(token, getJwtSecret(), { algorithms: ['HS256'] });
+    if (claims.token_type !== 'access') throw new Error('refresh token or missing access token type');
+    if (!claims.user_id || !claims.exp) throw new Error('token lacks identity or expiration');
+    const user = await fetchIdentity(token);
+    if (!user || String(user.id) !== String(claims.user_id)) throw new Error('current user could not be verified');
+    socket.user = user;
+    socket.accessToken = token;
+    const delay = Math.max(1, Math.min(2147483647, claims.exp * 1000 - Date.now()));
+    const timer = setTimeout(() => socket.disconnect(true), delay);
+    timer.unref?.();
+    socket.once('disconnect', () => clearTimeout(timer));
+    next();
   } catch (error) {
-    return next(new Error('Unauthorized socket connection'));
+    next(new Error(`Authentication required: ${error.message}`));
   }
 }

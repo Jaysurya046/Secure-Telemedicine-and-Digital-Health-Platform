@@ -76,11 +76,21 @@ class ConsultationMessage(models.Model):
     )
     sender = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
     message = models.TextField()
+    # client_msg_id: client-supplied UUID for idempotent retry; blank means no dedup
+    client_msg_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
     sent_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         db_table = 'consultation_messages'
-        ordering = ['sent_at']
+        ordering = ['-sent_at', '-id']
+        # Prevent duplicate persisted messages when client_msg_id is set
+        constraints = [
+            models.UniqueConstraint(
+                fields=['consultation', 'sender', 'client_msg_id'],
+                condition=models.Q(client_msg_id__gt=''),
+                name='unique_consultation_client_msg_id',
+            )
+        ]
 
     def __str__(self):
         return f"{self.sender.email}: {self.message[:40]}"

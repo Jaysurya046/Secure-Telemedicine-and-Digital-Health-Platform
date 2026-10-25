@@ -14,7 +14,7 @@ class ConsultationMessageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ConsultationMessage
-        fields = ['id', 'consultation', 'sender', 'sender_email', 'message', 'sent_at']
+        fields = ['id', 'consultation', 'sender', 'sender_email', 'message', 'client_msg_id', 'sent_at']
         read_only_fields = ['id', 'sender', 'sender_email', 'sent_at']
 
 
@@ -26,7 +26,6 @@ class OptionalBooleanField(serializers.BooleanField):
 class ConsultationSerializer(serializers.ModelSerializer):
     patient_detail = PatientListSerializer(source='patient', read_only=True)
     doctor_detail = DoctorListSerializer(source='doctor', read_only=True)
-    messages = ConsultationMessageSerializer(many=True, read_only=True)
     follow_up_required = OptionalBooleanField(required=False)
 
     class Meta:
@@ -35,7 +34,7 @@ class ConsultationSerializer(serializers.ModelSerializer):
             'id', 'appointment', 'patient', 'doctor', 'patient_detail',
             'doctor_detail', 'status', 'room_id', 'started_at', 'ended_at',
             'chief_complaint', 'diagnosis', 'clinical_notes',
-            'follow_up_required', 'follow_up_notes', 'messages', 'created_at',
+            'follow_up_required', 'follow_up_notes', 'created_at',
             'updated_at',
         ]
         read_only_fields = ['id', 'room_id', 'started_at', 'ended_at', 'created_at', 'updated_at']
@@ -230,3 +229,18 @@ class ConsultationEndSerializer(serializers.Serializer):
                     for field in sorted(extra_fields)
                 })
         return attrs
+
+
+class MessageCreateSerializer(serializers.Serializer):
+    message = serializers.CharField(max_length=2000, allow_blank=False)
+    client_msg_id = serializers.CharField(max_length=64, required=False, allow_blank=True)
+
+    def to_internal_value(self, data):
+        if isinstance(data, Mapping):
+            extra = set(data) - {'message', 'client_msg_id'}
+            if extra:
+                raise serializers.ValidationError({key: 'Unexpected field.' for key in sorted(extra)})
+            for key in ('message', 'client_msg_id'):
+                if key in data and not isinstance(data[key], str):
+                    raise serializers.ValidationError({key: 'Expected a string.'})
+        return super().to_internal_value(data)

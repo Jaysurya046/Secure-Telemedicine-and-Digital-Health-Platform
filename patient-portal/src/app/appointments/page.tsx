@@ -15,6 +15,7 @@ import {
   Stethoscope,
   X
 } from 'lucide-react';
+import { OpenConsultationButton } from '@/components/OpenConsultationButton';
 import { AppNav } from '@/components/AppNav';
 import { apiFetch, toIsoTimestamp, isInvalidPageError } from '@/lib/api';
 
@@ -153,7 +154,7 @@ export default function AppointmentsPage() {
 
     fetchAvailability();
 
-    return () => {
+  return () => {
       isCurrent = false;
     };
   }, [selectedDoctorId]);
@@ -607,6 +608,7 @@ export default function AppointmentsPage() {
 
                   {/* Actions according to status */}
                   <div className="mt-3 flex items-center gap-2 border-t border-slate-100 pt-3">
+                    {(appt.status === 'confirmed' || appt.status === 'completed') && <OpenConsultationButton appointmentId={appt.id} />}
                     {appt.status === 'pending' && (
                       <button
                         onClick={() => {

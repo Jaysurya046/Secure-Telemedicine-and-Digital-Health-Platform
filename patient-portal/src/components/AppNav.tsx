@@ -1,4 +1,7 @@
+'use client';
+
 import Link from 'next/link';
+import { clearTokens } from '../lib/api';
 import { CalendarDays, ClipboardList, HeartPulse, LogIn, Video } from 'lucide-react';
 
 export function AppNav() {
@@ -12,7 +15,8 @@ export function AppNav() {
         <nav className="flex items-center gap-2 text-sm font-semibold text-slate-600">
           <Link className="btn btn-secondary px-3 py-2" href="/dashboard"><ClipboardList className="h-4 w-4" aria-hidden />Dashboard</Link>
           <Link className="btn btn-secondary px-3 py-2" href="/appointments"><CalendarDays className="h-4 w-4" aria-hidden />Appointments</Link>
-          <Link className="btn btn-secondary px-3 py-2" href="/consultation/demo"><Video className="h-4 w-4" aria-hidden />Consult</Link>
+          <Link className="btn btn-secondary px-3 py-2" href="/appointments"><Video className="h-4 w-4" aria-hidden />Consult</Link>
+          <button type="button" onClick={() => { clearTokens(); window.location.assign('/login'); }}>Sign out</button>
           <Link className="btn btn-primary px-3 py-2" href="/login"><LogIn className="h-4 w-4" aria-hidden />Sign in</Link>
         </nav>
       </div>

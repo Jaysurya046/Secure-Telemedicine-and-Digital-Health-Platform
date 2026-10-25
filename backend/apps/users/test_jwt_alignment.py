@@ -62,7 +62,14 @@ class JWTConfigurationAlignmentTests(SimpleTestCase):
         import { authenticateSocket, getJwtSecret } from './src/auth/middleware.js';
 
         const token = process.env.TEST_AUTH_TOKEN;
+        // This test isolates signing-key alignment. Identity HTTP integration is
+        // exercised separately against a running Django server.
+        const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+        globalThis.fetch = async () => new Response(JSON.stringify({
+          id: payload.user_id, role: payload.role, email: payload.email
+        }), {status: 200});
         const socket = {
+            once() {}, disconnect() {},
             handshake: {
                 auth: { token },
                 headers: {}
@@ -217,7 +224,7 @@ class JWTConfigurationAlignmentTests(SimpleTestCase):
         result = self._verify_token_with_realtime_middleware(token_str, realtime_env)
 
         self.assertFalse(result['success'])
-        self.assertEqual(result['error'], 'Unauthorized socket connection')
+        self.assertIn('invalid signature', result['error'])
 
     def test_missing_or_blank_jwt_secret_falls_back_consistently(self):
         """

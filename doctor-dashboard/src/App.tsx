@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import type { FormEvent } from 'react';
 import { Activity, LogIn, Stethoscope, CalendarCheck, Clock, Users, Video, ShieldAlert } from 'lucide-react';
 import { Dashboard } from './pages/Dashboard';
@@ -6,9 +6,10 @@ import { Appointments } from './pages/Appointments';
 import { Availability } from './pages/Availability';
 import { Patients } from './pages/Patients';
 import { Consultation } from './pages/Consultation';
+import { getOrCreateConsultation } from './services/consultations';
 import { PatientHistory } from './components/PatientHistory';
 import { PrescriptionForm } from './components/PrescriptionForm';
-import { apiFetch, login, clearTokens, getToken } from './services/api';
+import { apiFetch, login, clearTokens, getToken, formatErrorMessage } from './services/api';
 
 type Tab = 'dashboard' | 'appointments' | 'availability' | 'patients' | 'consultation';
 
@@ -24,9 +25,11 @@ export default function App() {
   const [patients, setPatients] = useState<any[]>([]);
   const [records, setRecords] = useState<any[]>([]);
   const [selectedPatient, setSelectedPatient] = useState<any>(null);
-  const [consultationRoomId, setConsultationRoomId] = useState<string>('demo');
   const [error, setError] = useState('');
   const [loadingSession, setLoadingSession] = useState<boolean>(false);
+
+  // Active consultation opened from an appointment
+  const [activeConsultationId, setActiveConsultationId] = useState<string | undefined>(undefined);
 
   useEffect(() => {
     sessionIdRef.current = sessionId;
@@ -69,6 +72,7 @@ export default function App() {
       setPatients([]);
       setRecords([]);
       setSelectedPatient(null);
+      setActiveConsultationId(undefined);
     }
   }, [isAuthenticated, sessionId]);
 
@@ -81,6 +85,7 @@ export default function App() {
     setPatients([]);
     setRecords([]);
     setSelectedPatient(null);
+    setActiveConsultationId(undefined);
 
     try {
       await login(email, password);
@@ -101,6 +106,7 @@ export default function App() {
     setSessionId(nextSession);
 
     // Unmount and wipe all session-specific state
+    // Active consultation unmounts → its useEffect cleanup disconnects its socket
     setIsAuthenticated(false);
     setEmail('');
     setPassword('');
@@ -109,6 +115,7 @@ export default function App() {
     setPatients([]);
     setRecords([]);
     setSelectedPatient(null);
+    setActiveConsultationId(undefined);
     setTab('dashboard');
   }
 
@@ -121,6 +128,26 @@ export default function App() {
       setRecords(data.results || data);
     }
   }
+
+  /**
+   * Opens (or creates) the consultation for a confirmed appointment.
+   * 1. Check if the appointment already has a consultation via the API.
+   * 2. If not, create one.
+   * 3. Navigate to the consultation tab with the real consultation ID.
+   */
+  const openingConsultation = useRef(false);
+  const openConsultationForAppointment = useCallback(async (appointmentId: string) => {
+    if (!appointmentId || openingConsultation.current) return;
+    const session = sessionIdRef.current;
+    openingConsultation.current = true;
+    try {
+      const consultation = await getOrCreateConsultation(appointmentId);
+      if (session !== sessionIdRef.current || !getToken()) return;
+      setActiveConsultationId(consultation.id); setTab('consultation');
+    } catch (error) {
+      if (session === sessionIdRef.current && getToken()) setError(formatErrorMessage(error));
+    } finally { openingConsultation.current = false; }
+  }, []);
 
   return (
     <main className="shell">
@@ -204,7 +231,11 @@ export default function App() {
             ) : null}
 
             {tab === 'appointments' ? (
-              <Appointments key={`appts-${sessionId}`} onRefreshDashboard={loadData} />
+              <Appointments
+                key={`appts-${sessionId}`}
+                onRefreshDashboard={loadData}
+                onOpenConsultation={openConsultationForAppointment}
+              />
             ) : null}
 
             {tab === 'availability' ? (
@@ -222,7 +253,11 @@ export default function App() {
             ) : null}
 
             {tab === 'consultation' ? (
-              <Consultation key={`consult-${sessionId}`} roomId={consultationRoomId} />
+              <Consultation
+                key={`consult-${sessionId}-${activeConsultationId}`}
+                consultationId={activeConsultationId}
+                onCompleted={loadData}
+              />
             ) : null}
           </>
         )}
