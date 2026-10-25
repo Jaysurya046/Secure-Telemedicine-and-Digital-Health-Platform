@@ -200,7 +200,7 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
     assert.equal(screen.queryByText('Monday'), null);
   });
 
-  it('submits patient booking, pending rescheduling, and cancellation with actual request payloads', async () => {
+  it('performs actual rendered-form submissions for patient booking, rescheduling, and cancellation', async () => {
     const doctorsList = [
       { id: 'doc-1', email: 'doctor1@example.com', profile: { full_name: 'Dr. Sarah Connor' } }
     ];
@@ -254,10 +254,12 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
         const newAppt = {
           id: 'appt-new-1',
           doctor: body.doctor,
+          doctor_detail: doctorsList[0],
           scheduled_start: body.scheduled_start,
           scheduled_end: body.scheduled_end,
           status: 'pending' as const,
           reason: body.reason,
+          symptoms: body.symptoms,
           created_at: '2026-10-25T12:00:00Z'
         };
         currentAppointments.push(newAppt);
@@ -272,7 +274,8 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
 
       if (method === 'POST' && url.includes('/api/appointments/appt-patient-1/cancel/')) {
         currentAppointments[0].status = 'cancelled' as any;
-        return new Response(JSON.stringify({ ...currentAppointments[0], cancellation_reason: body?.cancellation_reason }), {
+        (currentAppointments[0] as any).cancellation_reason = body?.cancellation_reason;
+        return new Response(JSON.stringify(currentAppointments[0]), {
           status: 200,
           headers: { 'Content-Type': 'application/json' }
         });
@@ -281,22 +284,60 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
       return new Response(JSON.stringify({ results: [] }), { status: 200 });
     };
 
-    render(<AppointmentsPage />);
+    const { container } = render(<AppointmentsPage />);
 
     await waitFor(() => {
       assert.ok(screen.getByText('Existing Consultation'));
     });
 
-    // 1. Rescheduling: Click Reschedule button on pending appointment
-    const rescheduleBtn = screen.getByText('Reschedule');
-    fireEvent.click(rescheduleBtn);
+    // 1. Actual Rendered-Form Submission for Booking Appointment
+    // Select doctor from dropdown
+    const doctorSelect = screen.getByRole('combobox');
+    fireEvent.change(doctorSelect, { target: { value: 'doc-1' } });
+
+    await waitFor(() => {
+      assert.ok(screen.getByText(/09:00 - 17:00 UTC/));
+    });
+
+    // Fill in scheduled start and end
+    const datetimeInputs = container.querySelectorAll<HTMLInputElement>('input[type="datetime-local"]');
+    assert.ok(datetimeInputs.length >= 2, 'Found datetime inputs in booking form');
+    fireEvent.change(datetimeInputs[0], { target: { value: '2026-11-03T10:00' } });
+    fireEvent.change(datetimeInputs[1], { target: { value: '2026-11-03T11:00' } });
+
+    // Fill in reason
+    const reasonTextarea = screen.getByPlaceholderText(/Annual wellness checkup/i);
+    fireEvent.change(reasonTextarea, { target: { value: 'Annual Wellness Consultation' } });
+
+    // Fill in symptoms
+    const symptomsInput = screen.getByPlaceholderText(/fever, headache, fatigue/i);
+    fireEvent.change(symptomsInput, { target: { value: 'fever, headache' } });
+
+    // Submit booking form
+    const bookButton = screen.getByRole('button', { name: /Book Consultation/i });
+    fireEvent.click(bookButton);
+
+    await waitFor(() => {
+      assert.ok(screen.getByText(/Appointment booked successfully!/));
+    });
+
+    const bookReq = capturedRequests.find((r) => r.method === 'POST' && r.url.endsWith('/api/appointments/'));
+    assert.ok(bookReq, 'POST /api/appointments/ was sent');
+    assert.equal(bookReq.body.doctor, 'doc-1');
+    assert.ok(bookReq.body.scheduled_start.startsWith('2026-11-03'), 'Scheduled start in ISO format');
+    assert.ok(bookReq.body.scheduled_end.startsWith('2026-11-03'), 'Scheduled end in ISO format');
+    assert.equal(bookReq.body.reason, 'Annual Wellness Consultation');
+    assert.deepEqual(bookReq.body.symptoms, ['fever', 'headache']);
+
+    // 2. Actual Rendered-Form Submission for Rescheduling
+    const rescheduleBtns = screen.getAllByText('Reschedule');
+    fireEvent.click(rescheduleBtns[0]);
 
     await waitFor(() => {
       assert.ok(screen.getByText('Confirm Reschedule'));
     });
 
     const modalInputs = screen.getAllByDisplayValue('');
-    // First datetime input is start, second is end in modal
     fireEvent.change(modalInputs[modalInputs.length - 2], { target: { value: '2026-11-04T10:00' } });
     fireEvent.change(modalInputs[modalInputs.length - 1], { target: { value: '2026-11-04T11:00' } });
 
@@ -309,16 +350,16 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
       assert.ok(patchReq.body.scheduled_start.startsWith('2026-11-04'), 'Converted to ISO timestamp');
     });
 
-    // 2. Cancellation: Click Cancel button
-    const cancelBtn = screen.getByText('Cancel');
-    fireEvent.click(cancelBtn);
+    // 3. Actual Rendered-Form Submission for Cancellation
+    const cancelBtns = screen.getAllByText('Cancel');
+    fireEvent.click(cancelBtns[0]);
 
     await waitFor(() => {
       assert.ok(screen.getByText('Confirm Cancellation'));
     });
 
-    const reasonTextarea = screen.getByPlaceholderText(/e\.g\. Schedule conflict/);
-    fireEvent.change(reasonTextarea, { target: { value: 'Patient emergency conflict' } });
+    const reasonInput = screen.getByPlaceholderText(/e\.g\. Schedule conflict/);
+    fireEvent.change(reasonInput, { target: { value: 'Patient emergency conflict' } });
 
     const confirmCancelBtn = screen.getByText('Confirm Cancellation');
     fireEvent.click(confirmCancelBtn);
@@ -331,39 +372,83 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
     });
   });
 
-  it('recovers from DRF 404 "Invalid page." by loading page 1, and does not recover on unrelated 404s, 403s, or network failures', async () => {
+  it('navigates patient appointments to page 2, cancels final item via rendered form, returns DRF 404 Invalid page, and recovers to page 1', async () => {
     const requestedUrls: string[] = [];
+    const capturedMutations: Array<{ url: string; method: string; body: any }> = [];
 
-    globalThis.fetch = async (input: RequestInfo | URL) => {
+    const page1Items = Array.from({ length: 10 }, (_, i) => ({
+      id: `appt-pat1-${i + 1}`,
+      doctor: 'doc-1',
+      doctor_detail: { email: 'doctor1@example.com', profile: { full_name: 'Dr. Sarah Connor' } },
+      patient: 'patient-uuid',
+      scheduled_start: '2026-11-05T10:00:00Z',
+      scheduled_end: '2026-11-05T11:00:00Z',
+      status: 'pending' as const,
+      reason: `Page 1 Patient Appointment ${i + 1}`,
+      created_at: '2026-10-25T10:00:00Z'
+    }));
+
+    let page2Exists = true;
+
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      const method = init?.method || 'GET';
       requestedUrls.push(url);
 
       if (url.includes('/api/auth/doctors/')) {
         return new Response(JSON.stringify({ results: [], next: null }), { status: 200 });
       }
 
-      if (url.includes('/api/appointments/?page=2')) {
-        // DRF 404 response on page overflow
-        return new Response(JSON.stringify({ detail: 'Invalid page.' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' }
-        });
+      if (method === 'POST' && url.includes('/api/appointments/appt-p2-final/cancel/')) {
+        const body = init?.body ? JSON.parse(String(init.body)) : null;
+        capturedMutations.push({ url, method, body });
+        page2Exists = false;
+        return new Response(
+          JSON.stringify({
+            id: 'appt-p2-final',
+            status: 'cancelled',
+            cancellation_reason: body?.cancellation_reason
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
       }
 
       if (url.includes('/api/appointments/?page=1')) {
         return new Response(
           JSON.stringify({
-            count: 1,
-            next: null,
+            count: page2Exists ? 11 : 10,
+            next: page2Exists ? 'http://localhost:8000/api/appointments/?page=2' : null,
             previous: null,
+            results: page1Items
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+
+      if (url.includes('/api/appointments/?page=2')) {
+        if (!page2Exists) {
+          // DRF actual 404 response on out-of-range page request
+          return new Response(
+            JSON.stringify({ detail: 'Invalid page.' }),
+            { status: 404, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            count: 11,
+            next: null,
+            previous: 'http://localhost:8000/api/appointments/?page=1',
             results: [
               {
-                id: 'appt-recovered',
+                id: 'appt-p2-final',
                 doctor: 'doc-1',
-                scheduled_start: '2026-11-05T10:00:00Z',
-                scheduled_end: '2026-11-05T11:00:00Z',
-                status: 'pending',
-                reason: 'Recovered Page 1 Appointment'
+                doctor_detail: { email: 'doctor1@example.com', profile: { full_name: 'Dr. Sarah Connor' } },
+                patient: 'patient-uuid',
+                scheduled_start: '2026-11-06T15:00:00Z',
+                scheduled_end: '2026-11-06T16:00:00Z',
+                status: 'pending' as const,
+                reason: 'Final Patient Appointment on Page 2',
+                created_at: '2026-10-25T11:00:00Z'
               }
             ]
           }),
@@ -376,14 +461,62 @@ describe('Patient Portal: Real Component Workflow Tests', () => {
 
     render(<AppointmentsPage />);
 
+    // 1. Initial Load: Page 1 items are displayed
     await waitFor(() => {
-      assert.ok(screen.getByText('Recovered Page 1 Appointment'));
+      assert.ok(screen.getByText('Page 1 Patient Appointment 1'));
+    });
+    assert.ok(screen.getByText('Page 1'));
+
+    // 2. Navigate through rendered controls to Page 2
+    const nextBtn = screen.getByRole('button', { name: /Next/i });
+    assert.equal(nextBtn.hasAttribute('disabled'), false, 'Next button enabled on page 1');
+    fireEvent.click(nextBtn);
+
+    // 3. Verify Page 2 items are rendered
+    await waitFor(() => {
+      assert.ok(screen.getByText('Final Patient Appointment on Page 2'));
+    });
+    assert.ok(screen.getByText('Page 2'));
+
+    // 4. Remove final item through rendered Cancel form submission
+    const cancelBtn = screen.getByText('Cancel');
+    fireEvent.click(cancelBtn);
+
+    await waitFor(() => {
+      assert.ok(screen.getByText('Cancel Appointment'));
     });
 
-    // Case 1: Unrelated 404 Not found does NOT trigger pagination recovery
-    cleanup();
-    requestedUrls.length = 0;
+    const reasonInput = screen.getByPlaceholderText(/Schedule conflict, feeling better/i);
+    fireEvent.change(reasonInput, { target: { value: 'Cancelling final item on page 2' } });
 
+    const submitCancelBtn = screen.getByRole('button', { name: 'Confirm Cancellation' });
+    fireEvent.click(submitCancelBtn);
+
+    // 5. Assert mutation details
+    await waitFor(() => {
+      const cancelMutation = capturedMutations.find((m) => m.url.includes('/api/appointments/appt-p2-final/cancel/'));
+      assert.ok(cancelMutation, 'Cancel mutation executed');
+      assert.equal(cancelMutation.method, 'POST');
+      assert.deepEqual(cancelMutation.body, { cancellation_reason: 'Cancelling final item on page 2' });
+    });
+
+    // 6. Assert recovery to Page 1 occurred after DRF 404 Invalid page on Page 2
+    await waitFor(() => {
+      assert.ok(screen.getByText('Page 1 Patient Appointment 1'));
+      assert.ok(screen.getByText(/10 total appointment/));
+    });
+
+    const lastPage2ReqIdx = requestedUrls.findLastIndex((u) => u.includes('page=2'));
+    const lastPage1ReqIdx = requestedUrls.findLastIndex((u) => u.includes('page=1'));
+    assert.ok(lastPage2ReqIdx > 0, 'Page 2 was requested after mutation');
+    assert.ok(lastPage1ReqIdx > lastPage2ReqIdx, 'Page 1 recovery request occurred after DRF 404 on page 2');
+    assert.equal(screen.queryByText('Final Patient Appointment on Page 2'), null);
+  });
+
+  it('rejects pagination recovery for unrelated 404s, 403s, and network failures', async () => {
+    const requestedUrls: string[] = [];
+
+    // Case 1: Unrelated 404 Not found does NOT trigger pagination recovery
     globalThis.fetch = async (input: RequestInfo | URL) => {
       const url = String(input);
       requestedUrls.push(url);

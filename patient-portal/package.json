@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start -p 3000",
     "lint": "next lint",
-    "test": "npx tsx --test tests/patient_component_workflow.test.tsx"
+    "test": "tsx --test tests/patient_component_workflow.test.tsx"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.51.11",
@@ -29,6 +29,7 @@
     "jsdom": "^29.1.1",
     "postcss": "^8.4.39",
     "tailwindcss": "^3.4.6",
+    "tsx": "^4.23.15",
     "typescript": "^5.5.3"
   }
 }

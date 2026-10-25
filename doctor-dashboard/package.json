@@ -7,7 +7,7 @@
     "dev": "vite --host 0.0.0.0 --port 3001",
     "build": "tsc && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 3001",
-    "test": "npx tsx --test tests/doctor_component_workflow.test.tsx"
+    "test": "tsx --test tests/doctor_component_workflow.test.tsx"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.1",
@@ -22,6 +22,7 @@
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "jsdom": "^29.1.1",
+    "tsx": "^4.23.15",
     "typescript": "^5.5.3",
     "vite": "^5.3.4"
   }
